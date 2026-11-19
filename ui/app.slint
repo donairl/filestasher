@@ -255,6 +255,10 @@ export component MainWindow inherits Window {
     property <length> drag-x;
     property <length> drag-y;
     property <length> local-width: 420px;
+    // Column widths of the local pane grow with it, so a wider pane does not
+    // give all the extra room to the name column.
+    property <length> local-size-col: max(72px, root.local-width * 0.17);
+    property <length> local-modified-col: max(118px, root.local-width * 0.28);
     // Left edges of the S3 area and of the local pane with its handle.
     property <length> main-left: (root.sidebar-open ? root.sidebar-width : 0px) + 14px;
     // Panel widths, changed by dragging the handles. Each panel may grow
@@ -949,7 +953,7 @@ export component MainWindow inherits Window {
 
                     HeaderCell {
                         title: "Size";
-                        width: 72px;
+                        width: root.local-size-col;
                         align-right: true;
                         active: root.local-sort-column == 1;
                         descending: root.local-sort-descending;
@@ -960,7 +964,7 @@ export component MainWindow inherits Window {
 
                     HeaderCell {
                         title: "Modified";
-                        width: 118px;
+                        width: root.local-modified-col;
                         active: root.local-sort-column == 2;
                         descending: root.local-sort-descending;
                         clicked => {
@@ -1062,7 +1066,7 @@ export component MainWindow inherits Window {
 
                             Text {
                                 text: entry.size;
-                                width: 72px;
+                                width: root.local-size-col;
                                 horizontal-alignment: right;
                                 vertical-alignment: center;
                                 color: entry.selected ? Palette.selection-foreground : Palette.foreground;
@@ -1070,7 +1074,7 @@ export component MainWindow inherits Window {
 
                             Text {
                                 text: entry.modified;
-                                width: 118px;
+                                width: root.local-modified-col;
                                 vertical-alignment: center;
                                 overflow: elide;
                                 color: entry.selected ? Palette.selection-foreground : Palette.foreground;
