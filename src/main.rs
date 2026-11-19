@@ -300,6 +300,11 @@ impl App {
                 ui.set_in_bucket(t.bucket.is_some());
                 ui.set_has_more(t.next_token.is_some());
                 ui.set_search_text(t.filter.as_str().into());
+                // An active search is always visible. An empty box stays as
+                // the user left it.
+                if !t.filter.is_empty() {
+                    ui.set_search_open(true);
+                }
             }
             None => {
                 ui.set_location(SharedString::new());
@@ -308,6 +313,7 @@ impl App {
                 ui.set_in_bucket(false);
                 ui.set_has_more(false);
                 ui.set_search_text(SharedString::new());
+                ui.set_search_open(false);
             }
         }
     }
@@ -341,6 +347,17 @@ impl App {
         };
         self.ui().set_search_info(info.into());
         self.entries.set_vec(rows);
+    }
+
+    /// Closes the search box when the active tab has no search. Called when
+    /// the tab or the folder changes.
+    fn reset_search_box(&self) {
+        let searching = self
+            .state
+            .borrow()
+            .active_tab()
+            .is_some_and(|t| !t.filter.is_empty());
+        self.ui().set_search_open(searching);
     }
 
     /// Entry index behind a row on screen.
@@ -575,6 +592,7 @@ impl App {
             st.active = Some(st.tabs.len() - 1);
             id
         };
+        self.reset_search_box();
         self.load(id);
     }
 
@@ -588,6 +606,7 @@ impl App {
             }
             st.active = Some(index);
         }
+        self.reset_search_box();
         self.sync_view();
         self.continue_search();
     }
@@ -607,6 +626,7 @@ impl App {
             };
             st.global_status.clear();
         }
+        self.reset_search_box();
         self.sync_view();
     }
 
@@ -791,6 +811,7 @@ impl App {
             t.filter.clear();
             t.id
         };
+        self.reset_search_box();
         self.load(id);
     }
 
@@ -838,6 +859,32 @@ impl App {
         if !already {
             self.row_clicked(row, false);
         }
+    }
+
+    /// Copies the selected entries' paths to the clipboard, one per line:
+    /// object keys, or `s3://bucket/key` URIs.
+    fn copy_path(&self, as_uri: bool) {
+        let text = {
+            let st = self.state.borrow();
+            let Some(t) = st.active_tab() else { return };
+            let paths: Vec<String> = t
+                .selected_entries()
+                .iter()
+                .map(|e| match (&t.bucket, as_uri) {
+                    (Some(b), true) => format!("s3://{b}/{}", e.key),
+                    // In the bucket list the key is the bucket name.
+                    (None, true) => format!("s3://{}", e.key),
+                    (_, false) => e.key.clone(),
+                })
+                .collect();
+            if paths.is_empty() {
+                return;
+            }
+            paths.join("\n")
+        };
+        let count = text.lines().count();
+        self.ui().invoke_copy_to_clipboard(text.into());
+        self.notify(format!("Copied {count} path(s) to the clipboard."));
     }
 
     /// Opens the preview overlay and loads the image in the background.
@@ -914,6 +961,7 @@ impl App {
             t.filter.clear();
             t.id
         };
+        self.reset_search_box();
         self.load(id);
     }
 
@@ -1283,6 +1331,7 @@ fn main() -> Result<()> {
     ui.on_create_folder(|name| with_app(|a| a.create_folder(&name)));
     ui.on_row_clicked(|i, toggle| with_app(|a| a.row_clicked(i as usize, toggle)));
     ui.on_row_activated(|i| with_app(|a| a.row_activated(i as usize)));
+    ui.on_copy_path(|as_uri| with_app(|a| a.copy_path(as_uri)));
     ui.on_row_context(|i| with_app(|a| a.row_context(i as usize)));
     ui.on_confirm_accepted(|| with_app(|a| a.confirm_accepted()));
 
