@@ -26,6 +26,13 @@ pub fn format_time(secs: i64) -> String {
         .unwrap_or_default()
 }
 
+/// Whether the file name has an extension the preview can decode.
+pub fn is_image(name: &str) -> bool {
+    const EXTS: [&str; 7] = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"];
+    name.rsplit_once('.')
+        .is_some_and(|(_, ext)| EXTS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
 /// Parent of a folder prefix: `a/b/` -> `a/`, `a/` -> ``.
 pub fn parent_prefix(prefix: &str) -> String {
     let trimmed = prefix.trim_end_matches('/');
@@ -68,6 +75,16 @@ mod tests {
         assert_eq!(format_size(1536), "1.5 KB");
         assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
         assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn images() {
+        assert!(is_image("a.png"));
+        assert!(is_image("photo.JPG"));
+        assert!(is_image("dir.v2/x.webp"));
+        assert!(!is_image("a.txt"));
+        assert!(!is_image("png"));
+        assert!(!is_image("a.svg"));
     }
 
     #[test]

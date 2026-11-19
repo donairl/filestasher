@@ -21,7 +21,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use config::{Config, ServerProfile};
 use s3::Entry;
-use util::{format_size, format_time, parent_prefix, safe_join};
+use util::{format_size, format_time, is_image, parent_prefix, safe_join};
 
 slint::include_modules!();
 
@@ -81,7 +81,14 @@ struct State {
     pending: Option<Pending>,
     /// Shown when no tab is open.
     global_status: String,
+    /// Bumped per preview; results of older previews are dropped.
+    preview_generation: u64,
 }
+
+/// Larger images are not downloaded for preview.
+const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
+/// Longest side of the decoded preview, in pixels.
+const MAX_PREVIEW_SIDE: u32 = 2048;
 
 impl State {
     fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
@@ -576,6 +583,48 @@ impl App {
         }
     }
 
+    /// Opens the preview overlay and loads the image in the background.
+    fn preview(&self, client: Client, bucket: String, entry: Entry) {
+        if entry.size > MAX_PREVIEW_BYTES {
+            return self.notify(format!(
+                "{} is too large to preview ({}).",
+                entry.name,
+                format_size(entry.size)
+            ));
+        }
+        let generation = {
+            let mut st = self.state.borrow_mut();
+            st.preview_generation += 1;
+            st.preview_generation
+        };
+        let ui = self.ui();
+        ui.set_preview_title(entry.name.as_str().into());
+        ui.set_preview_info(SharedString::new());
+        ui.set_preview_message("Loading…".into());
+        ui.set_preview_image(slint::Image::default());
+        ui.set_preview_open(true);
+        self.rt.spawn(async move {
+            let result = load_preview(&client, &bucket, &entry.key).await;
+            on_ui(move |app| {
+                let ui = app.ui();
+                // Closed, or replaced by a newer preview.
+                if app.state.borrow().preview_generation != generation || !ui.get_preview_open() {
+                    return;
+                }
+                match result {
+                    Ok((pixels, width, height)) => {
+                        ui.set_preview_image(slint::Image::from_rgba8(pixels));
+                        ui.set_preview_info(
+                            format!("{width} × {height} · {}", format_size(entry.size)).into(),
+                        );
+                        ui.set_preview_message(SharedString::new());
+                    }
+                    Err(e) => ui.set_preview_message(format!("Cannot preview: {e:#}").into()),
+                }
+            });
+        });
+    }
+
     fn row_activated(&self, index: usize) {
         let id = {
             let mut st = self.state.borrow_mut();
@@ -584,6 +633,16 @@ impl App {
                 return;
             };
             if !entry.is_dir {
+                let target = match &t.bucket {
+                    Some(b) if is_image(&entry.name) => {
+                        Some((t.client.clone(), b.clone(), entry.clone()))
+                    }
+                    _ => None,
+                };
+                drop(st);
+                if let Some((client, bucket, entry)) = target {
+                    self.preview(client, bucket, entry);
+                }
                 return;
             }
             if t.bucket.is_none() {
@@ -836,6 +895,33 @@ async fn download_items(
         count += 1;
     }
     Ok((count, skipped))
+}
+
+/// Downloads and decodes an image. Returns the pixels and the original size;
+/// large images are scaled down to [`MAX_PREVIEW_SIDE`].
+async fn load_preview(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<(slint::SharedPixelBuffer<slint::Rgba8Pixel>, u32, u32)> {
+    let bytes = s3::get_bytes(client, bucket, key).await?;
+    tokio::task::spawn_blocking(move || {
+        let img = image::load_from_memory(&bytes)?;
+        let (width, height) = (img.width(), img.height());
+        let img = if width.max(height) > MAX_PREVIEW_SIDE {
+            img.thumbnail(MAX_PREVIEW_SIDE, MAX_PREVIEW_SIDE)
+        } else {
+            img
+        };
+        let rgba = img.to_rgba8();
+        let pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+        );
+        Ok((pixels, width, height))
+    })
+    .await?
 }
 
 async fn delete_items(client: &Client, bucket: &str, items: &[Entry]) -> Result<usize> {

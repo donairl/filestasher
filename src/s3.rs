@@ -183,6 +183,23 @@ pub async fn list_all(client: &Client, bucket: &str, prefix: &str) -> Result<Vec
     Ok(out)
 }
 
+/// Reads a whole object into memory.
+pub async fn get_bytes(client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>> {
+    let resp = client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| sdk_err(&format!("download {key}"), e))?;
+    let data = resp
+        .body
+        .collect()
+        .await
+        .with_context(|| format!("cannot read {key}"))?;
+    Ok(data.to_vec())
+}
+
 pub async fn download_file(
     client: &Client,
     bucket: &str,

@@ -91,6 +91,7 @@ export component MainWindow inherits Window {
     // Servers
     in property <[ServerItem]> servers;
     in-out property <int> selected-server: -1;
+    in-out property <bool> sidebar-open: true;
     callback connect-server(int);
     callback add-server();
     callback edit-server(int);
@@ -136,6 +137,13 @@ export component MainWindow inherits Window {
     callback save-server();
     callback test-server();
 
+    // Image preview
+    in-out property <bool> preview-open;
+    in property <string> preview-title;
+    in property <string> preview-info;
+    in property <string> preview-message;
+    in property <image> preview-image;
+
     // Confirm dialog
     in-out property <bool> confirm-open;
     in property <string> confirm-text;
@@ -147,7 +155,7 @@ export component MainWindow inherits Window {
 
     HorizontalLayout {
         // Sidebar
-        Rectangle {
+        if root.sidebar-open: Rectangle {
             width: 230px;
             background: Palette.alternate-background;
             VerticalLayout {
@@ -228,6 +236,25 @@ export component MainWindow inherits Window {
                             root.delete-server(root.selected-server);
                         }
                     }
+                }
+            }
+        }
+
+        // Handle that hides or shows the sidebar
+        Rectangle {
+            width: 14px;
+            background: hta.has-hover ? Palette.control-background : Palette.alternate-background;
+            Text {
+                text: root.sidebar-open ? "‹" : "›";
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                font-size: 16px;
+            }
+
+            hta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.sidebar-open = !root.sidebar-open;
                 }
             }
         }
@@ -478,6 +505,65 @@ export component MainWindow inherits Window {
                             progress: root.transfer-progress;
                         }
                     }
+                }
+            }
+        }
+    }
+
+    if root.preview-open: Rectangle {
+        background: #000000e0;
+
+        // Click anywhere to close.
+        TouchArea {
+            clicked => {
+                root.preview-open = false;
+            }
+        }
+
+        VerticalLayout {
+            padding: 12px;
+            spacing: 8px;
+            HorizontalLayout {
+                spacing: 12px;
+                Text {
+                    text: root.preview-title;
+                    color: white;
+                    font-weight: 600;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                Text {
+                    text: root.preview-info;
+                    color: #cccccc;
+                    vertical-alignment: center;
+                }
+
+                Button {
+                    text: "Close";
+                    clicked => {
+                        root.preview-open = false;
+                    }
+                }
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+                // Shown at natural size, scaled down only when it does not fit.
+                Image {
+                    source: root.preview-image;
+                    image-fit: contain;
+                    width: min(parent.width, self.source.width * 1px);
+                    height: min(parent.height, self.source.height * 1px);
+                }
+
+                Text {
+                    text: root.preview-message;
+                    color: white;
+                    wrap: word-wrap;
+                    width: min(parent.width, 520px);
+                    horizontal-alignment: center;
                 }
             }
         }
