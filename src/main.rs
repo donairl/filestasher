@@ -72,6 +72,15 @@ impl Tab {
     }
 }
 
+/// A file or folder in the local pane.
+#[derive(Clone, Debug)]
+struct LocalEntry {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    size: u64,
+}
+
 enum Pending {
     DeleteServer(usize),
     DeleteObjects {
@@ -99,6 +108,13 @@ struct State {
     preview_generation: u64,
     /// Order of every tab's listing.
     sort: SortOrder,
+    /// Folder shown in the local pane, with its listing and selection.
+    local_dir: PathBuf,
+    local_entries: Vec<LocalEntry>,
+    local_selected: Vec<bool>,
+    local_status: String,
+    /// Bumped per local listing; older results are dropped.
+    local_generation: u64,
     /// For each row on screen, its index in the active tab's entries. Differs
     /// from the identity while a search filter hides entries.
     visible: Vec<usize>,
@@ -181,6 +197,7 @@ struct App {
     rt: tokio::runtime::Handle,
     state: RefCell<State>,
     entries: Rc<VecModel<FileEntry>>,
+    local_rows: Rc<VecModel<FileEntry>>,
 }
 
 thread_local! {
@@ -975,9 +992,9 @@ impl App {
     // ---- File operations -------------------------------------------------
 
     fn upload(&self) {
-        let Some((tab_id, client, bucket, prefix)) = self.active_target() else {
+        if self.active_target().is_none() {
             return;
-        };
+        }
         self.rt.spawn(async move {
             let Some(files) = rfd::AsyncFileDialog::new()
                 .set_title("Upload files")
@@ -987,7 +1004,74 @@ impl App {
                 return;
             };
             let paths: Vec<PathBuf> = files.iter().map(|f| f.path().to_path_buf()).collect();
-            let result = upload_files(&client, &bucket, &prefix, &paths).await;
+            on_ui(move |app| app.upload_paths(paths));
+        });
+    }
+
+    fn download(&self) {
+        self.download_to(None);
+    }
+
+    /// Downloads the selected entries into `dest`, or into a folder the user
+    /// picks when `dest` is `None`.
+    fn download_to(&self, dest: Option<PathBuf>) {
+        let Some((tab_id, client, bucket, _)) = self.active_target() else {
+            return;
+        };
+        let items = self
+            .state
+            .borrow()
+            .active_tab()
+            .map(Tab::selected_entries)
+            .unwrap_or_default();
+        if items.is_empty() {
+            return self.notify("Select files or folders to download first.".into());
+        }
+        self.rt.spawn(async move {
+            let dest = match dest {
+                Some(d) => d,
+                None => {
+                    let Some(dir) = rfd::AsyncFileDialog::new()
+                        .set_title("Download to folder")
+                        .pick_folder()
+                        .await
+                    else {
+                        return;
+                    };
+                    dir.path().to_path_buf()
+                }
+            };
+            let result = download_items(&client, &bucket, &items, &dest).await;
+            on_ui(move |app| {
+                app.set_status(
+                    tab_id,
+                    match result {
+                        Ok((n, 0)) => format!("Downloaded {n} file(s) to {}", dest.display()),
+                        Ok((n, skipped)) => format!(
+                            "Downloaded {n} file(s) to {}, skipped {skipped} with unsafe names.",
+                            dest.display()
+                        ),
+                        Err(e) => format!("Download failed: {e:#}"),
+                    },
+                );
+                // Show the new files when they landed in the local pane's folder.
+                if app.state.borrow().local_dir == dest {
+                    app.local_load();
+                }
+            });
+        });
+    }
+
+    /// Uploads local files and folders into the active tab's folder.
+    fn upload_paths(&self, paths: Vec<PathBuf>) {
+        let Some((tab_id, client, bucket, prefix)) = self.active_target() else {
+            return self.notify("Open a bucket before uploading.".into());
+        };
+        if paths.is_empty() {
+            return;
+        }
+        self.rt.spawn(async move {
+            let result = upload_files(&client, &bucket, &prefix, paths).await;
             on_ui(move |app| {
                 app.set_status(
                     tab_id,
@@ -1002,43 +1086,183 @@ impl App {
         });
     }
 
-    fn download(&self) {
-        let Some((tab_id, client, bucket, _)) = self.active_target() else {
-            return;
+    // ---- Local pane ------------------------------------------------------
+
+    fn sync_local(&self) {
+        let st = self.state.borrow();
+        let ui = self.ui();
+        ui.set_local_path(st.local_dir.display().to_string().into());
+        ui.set_local_status(st.local_status.as_str().into());
+        let rows: Vec<FileEntry> = st
+            .local_entries
+            .iter()
+            .zip(&st.local_selected)
+            .map(|(e, sel)| FileEntry {
+                name: e.name.as_str().into(),
+                is_dir: e.is_dir,
+                is_image: false,
+                size: if e.is_dir {
+                    SharedString::new()
+                } else {
+                    format_size(e.size).into()
+                },
+                modified: SharedString::new(),
+                selected: *sel,
+            })
+            .collect();
+        self.local_rows.set_vec(rows);
+    }
+
+    /// Reads the local pane's folder in the background.
+    fn local_load(&self) {
+        let (dir, generation) = {
+            let mut st = self.state.borrow_mut();
+            st.local_generation += 1;
+            (st.local_dir.clone(), st.local_generation)
         };
-        let items = self
-            .state
-            .borrow()
-            .active_tab()
-            .map(Tab::selected_entries)
-            .unwrap_or_default();
-        if items.is_empty() {
-            return self.notify("Select files or folders to download first.".into());
+        self.rt.spawn_blocking(move || {
+            let result = read_local_dir(&dir);
+            on_ui(move |app| {
+                {
+                    let mut st = app.state.borrow_mut();
+                    if st.local_generation != generation {
+                        return;
+                    }
+                    match result {
+                        Ok(entries) => {
+                            st.local_status = format!("{} item(s)", entries.len());
+                            st.local_selected = vec![false; entries.len()];
+                            st.local_entries = entries;
+                        }
+                        Err(e) => {
+                            st.local_status = format!("Error: {e:#}");
+                            st.local_entries.clear();
+                            st.local_selected.clear();
+                        }
+                    }
+                }
+                app.sync_local();
+            });
+        });
+    }
+
+    fn local_open_dir(&self, dir: PathBuf) {
+        self.state.borrow_mut().local_dir = dir;
+        self.local_load();
+    }
+
+    fn local_up(&self) {
+        let parent = self.state.borrow().local_dir.parent().map(PathBuf::from);
+        if let Some(parent) = parent {
+            self.local_open_dir(parent);
         }
+    }
+
+    fn local_choose(&self) {
         self.rt.spawn(async move {
             let Some(dir) = rfd::AsyncFileDialog::new()
-                .set_title("Download to folder")
+                .set_title("Local folder")
                 .pick_folder()
                 .await
             else {
                 return;
             };
-            let dest = dir.path().to_path_buf();
-            let result = download_items(&client, &bucket, &items, &dest).await;
-            on_ui(move |app| {
-                app.set_status(
-                    tab_id,
-                    match result {
-                        Ok((n, 0)) => format!("Downloaded {n} file(s) to {}", dest.display()),
-                        Ok((n, skipped)) => format!(
-                            "Downloaded {n} file(s) to {}, skipped {skipped} with unsafe names.",
-                            dest.display()
-                        ),
-                        Err(e) => format!("Download failed: {e:#}"),
-                    },
-                );
-            });
+            let dir = dir.path().to_path_buf();
+            on_ui(move |app| app.local_open_dir(dir));
         });
+    }
+
+    fn local_row_clicked(&self, index: usize, toggle: bool) {
+        let selected = {
+            let mut st = self.state.borrow_mut();
+            if index >= st.local_selected.len() {
+                return;
+            }
+            if toggle {
+                st.local_selected[index] = !st.local_selected[index];
+            } else {
+                for (i, sel) in st.local_selected.iter_mut().enumerate() {
+                    *sel = i == index;
+                }
+            }
+            st.local_selected.clone()
+        };
+        for (i, sel) in selected.into_iter().enumerate() {
+            if let Some(mut row) = self.local_rows.row_data(i)
+                && row.selected != sel
+            {
+                row.selected = sel;
+                self.local_rows.set_row_data(i, row);
+            }
+        }
+    }
+
+    /// Press without Ctrl: keeps a selection that contains the row.
+    fn local_row_context(&self, index: usize) {
+        let already = self.state.borrow().local_selected.get(index) == Some(&true);
+        if !already {
+            self.local_row_clicked(index, false);
+        }
+    }
+
+    fn local_row_activated(&self, index: usize) {
+        let dir = {
+            let st = self.state.borrow();
+            match st.local_entries.get(index) {
+                Some(e) if e.is_dir => e.path.clone(),
+                _ => return,
+            }
+        };
+        self.local_open_dir(dir);
+    }
+
+    // ---- Drag and drop ---------------------------------------------------
+
+    /// Label that follows the pointer during a drag.
+    fn drag_started(&self, from_local: bool) {
+        let names: Vec<String> = {
+            let st = self.state.borrow();
+            if from_local {
+                st.local_entries
+                    .iter()
+                    .zip(&st.local_selected)
+                    .filter(|(_, sel)| **sel)
+                    .map(|(e, _)| e.name.clone())
+                    .collect()
+            } else {
+                st.active_tab()
+                    .map(Tab::selected_entries)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|e| e.name)
+                    .collect()
+            }
+        };
+        let label = match names.as_slice() {
+            [one] => one.clone(),
+            many => format!("{} items", many.len()),
+        };
+        self.ui().set_drag_label(label.into());
+    }
+
+    /// Local rows dropped on the S3 list upload; S3 rows dropped on the local
+    /// pane download into its folder.
+    fn dropped(&self, from_local: bool) {
+        if from_local {
+            let paths: Vec<PathBuf> = {
+                let st = self.state.borrow();
+                st.local_entries
+                    .iter()
+                    .zip(&st.local_selected)
+                    .filter(|(_, sel)| **sel)
+                    .map(|(e, _)| e.path.clone())
+                    .collect()
+            };
+            self.upload_paths(paths);
+        } else {
+            let dest = self.state.borrow().local_dir.clone();
+            self.download_to(Some(dest));
+        }
     }
 
     fn create_folder(&self, name: &str) {
@@ -1170,27 +1394,81 @@ fn count_status(count: usize, has_more: bool) -> String {
 
 // ---- Background work -------------------------------------------------------
 
-async fn upload_files(
-    client: &Client,
-    bucket: &str,
-    prefix: &str,
-    paths: &[PathBuf],
-) -> Result<usize> {
-    let mut total = 0;
-    for p in paths {
-        total += tokio::fs::metadata(p).await.map(|m| m.len()).unwrap_or(0);
+/// Lists a local folder: folders first, then by name. Hidden entries (names
+/// starting with a dot) are left out.
+fn read_local_dir(dir: &std::path::Path) -> Result<Vec<LocalEntry>> {
+    let mut out = Vec::new();
+    for item in std::fs::read_dir(dir)? {
+        let item = item?;
+        let name = item.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        // Follows symlinks; entries that cannot be read are skipped.
+        let Ok(meta) = std::fs::metadata(item.path()) else {
+            continue;
+        };
+        out.push(LocalEntry {
+            name,
+            path: item.path(),
+            is_dir: meta.is_dir(),
+            size: meta.len(),
+        });
     }
-    let job = Job::start(total);
-    let mut count = 0;
+    out.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
+    Ok(out)
+}
+
+/// Expands files and folders into (local path, object key, size). Folders are
+/// walked recursively; symlinked folders are not followed.
+fn collect_uploads(paths: &[PathBuf], prefix: &str) -> Result<Vec<(PathBuf, String, u64)>> {
+    fn walk(
+        path: &std::path::Path,
+        key: String,
+        out: &mut Vec<(PathBuf, String, u64)>,
+    ) -> Result<()> {
+        if std::fs::symlink_metadata(path)?.is_dir() {
+            for item in std::fs::read_dir(path)? {
+                let item = item?;
+                let name = item.file_name();
+                let Some(name) = name.to_str() else {
+                    anyhow::bail!("file name is not valid UTF-8: {}", item.path().display());
+                };
+                walk(&item.path(), format!("{key}/{name}"), out)?;
+            }
+        } else if let Ok(meta) = std::fs::metadata(path)
+            && meta.is_file()
+        {
+            out.push((path.to_path_buf(), key, meta.len()));
+        }
+        Ok(())
+    }
+
+    let mut out = Vec::new();
     for p in paths {
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
             anyhow::bail!("file name is not valid UTF-8: {}", p.display());
         };
-        let key = format!("{prefix}{name}");
-        s3::upload_file(client, bucket, &key, p, &|n| job.add(n)).await?;
-        count += 1;
+        walk(p, format!("{prefix}{name}"), &mut out)?;
     }
-    Ok(count)
+    Ok(out)
+}
+
+/// Uploads files and whole folders under `prefix`. Returns the file count.
+async fn upload_files(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    paths: Vec<PathBuf>,
+) -> Result<usize> {
+    let prefix_owned = prefix.to_string();
+    let files =
+        tokio::task::spawn_blocking(move || collect_uploads(&paths, &prefix_owned)).await??;
+    let job = Job::start(files.iter().map(|f| f.2).sum());
+    for (path, key, _) in &files {
+        s3::upload_file(client, bucket, key, path, &|n| job.add(n)).await?;
+    }
+    Ok(files.len())
 }
 
 /// Returns (files downloaded, keys skipped because they map to no safe path).
@@ -1294,16 +1572,21 @@ fn main() -> Result<()> {
 
     let entries = Rc::new(VecModel::<FileEntry>::default());
     ui.set_entries(ModelRc::from(entries.clone()));
+    let local_rows = Rc::new(VecModel::<FileEntry>::default());
+    ui.set_local_entries(ModelRc::from(local_rows.clone()));
+    state.local_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
 
     let app = Rc::new(App {
         ui: ui.as_weak(),
         rt: runtime.handle().clone(),
         state: RefCell::new(state),
         entries,
+        local_rows,
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
     app.sync_servers();
     app.sync_view();
+    app.local_load();
 
     ui.on_connect_server(|i| with_app(|a| a.connect(i as usize)));
     ui.on_add_server(|| with_app(|a| a.open_server_dialog(None)));
@@ -1333,6 +1616,14 @@ fn main() -> Result<()> {
     ui.on_row_activated(|i| with_app(|a| a.row_activated(i as usize)));
     ui.on_copy_path(|as_uri| with_app(|a| a.copy_path(as_uri)));
     ui.on_row_context(|i| with_app(|a| a.row_context(i as usize)));
+    ui.on_local_up(|| with_app(|a| a.local_up()));
+    ui.on_local_refresh(|| with_app(|a| a.local_load()));
+    ui.on_local_choose(|| with_app(|a| a.local_choose()));
+    ui.on_local_row_clicked(|i, toggle| with_app(|a| a.local_row_clicked(i as usize, toggle)));
+    ui.on_local_row_context(|i| with_app(|a| a.local_row_context(i as usize)));
+    ui.on_local_row_activated(|i| with_app(|a| a.local_row_activated(i as usize)));
+    ui.on_drag_started(|from_local| with_app(|a| a.drag_started(from_local)));
+    ui.on_dropped(|from_local| with_app(|a| a.dropped(from_local)));
     ui.on_confirm_accepted(|| with_app(|a| a.confirm_accepted()));
 
     ui.run()?;
@@ -1366,6 +1657,38 @@ mod tests {
         let mut selected = vec![false, false, true, false, false];
         SortOrder { column, descending }.apply(&mut entries, &mut selected);
         (entries.into_iter().map(|e| e.name).collect(), selected)
+    }
+
+    #[test]
+    fn local_listing_and_upload_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("docs/sub")).unwrap();
+        std::fs::write(root.join("b.txt"), b"12345").unwrap();
+        std::fs::write(root.join("A.txt"), b"1").unwrap();
+        std::fs::write(root.join(".hidden"), b"x").unwrap();
+        std::fs::write(root.join("docs/one.md"), b"12").unwrap();
+        std::fs::write(root.join("docs/sub/two.md"), b"123").unwrap();
+
+        let listing = read_local_dir(root).unwrap();
+        let names: Vec<&str> = listing.iter().map(|e| e.name.as_str()).collect();
+        // Folders first, case-insensitive order, hidden files left out.
+        assert_eq!(names, ["docs", "A.txt", "b.txt"]);
+        assert!(listing[0].is_dir);
+        assert_eq!(listing[2].size, 5);
+
+        let mut uploads =
+            collect_uploads(&[root.join("docs"), root.join("b.txt")], "base/").unwrap();
+        uploads.sort_by(|a, b| a.1.cmp(&b.1));
+        let keys: Vec<(&str, u64)> = uploads.iter().map(|u| (u.1.as_str(), u.2)).collect();
+        assert_eq!(
+            keys,
+            [
+                ("base/b.txt", 5),
+                ("base/docs/one.md", 2),
+                ("base/docs/sub/two.md", 3)
+            ]
+        );
     }
 
     #[test]

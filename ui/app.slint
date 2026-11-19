@@ -172,7 +172,7 @@ component EntryIcon inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: "S3 FStasher";
-    preferred-width: 1040px;
+    preferred-width: 1320px;
     preferred-height: 660px;
     min-width: 760px;
     min-height: 440px;
@@ -225,6 +225,46 @@ export component MainWindow inherits Window {
         clipboard.text = text;
         clipboard.select-all();
         clipboard.copy();
+    }
+
+    // Local folder pane
+    in-out property <bool> local-open: true;
+    in property <string> local-path;
+    in property <string> local-status;
+    in property <[FileEntry]> local-entries;
+    callback local-up();
+    callback local-refresh();
+    callback local-choose();
+    callback local-row-clicked(int, bool);
+    callback local-row-context(int);
+    callback local-row-activated(int);
+
+    // Drag and drop between the S3 list and the local pane
+    in property <string> drag-label;
+    // Sets drag-label for the rows about to be dragged; true = local rows.
+    callback drag-started(bool);
+    // A drag ended over the other pane; true = local rows dropped on S3.
+    callback dropped(bool);
+    property <bool> drag-active;
+    property <bool> drag-from-local;
+    property <length> drag-x;
+    property <length> drag-y;
+    property <length> local-width: 320px;
+    // Left edges of the S3 area and of the local pane with its handle.
+    property <length> main-left: (root.sidebar-open ? 230px : 0px) + 14px;
+    property <length> local-left: root.width - 14px - (root.local-open ? root.local-width : 0px);
+    property <bool> over-local: root.drag-active && !root.drag-from-local && root.local-open && root.drag-x >= root.width - root.local-width;
+    property <bool> over-remote: root.drag-active && root.drag-from-local && root.in-bucket && root.drag-x >= root.main-left && root.drag-x < root.local-left;
+
+    function end-drag() {
+        if (root.drag-active) {
+            if (root.over-local) {
+                root.dropped(false);
+            } else if (root.over-remote) {
+                root.dropped(true);
+            }
+            root.drag-active = false;
+        }
     }
 
     // Transfers
@@ -640,13 +680,43 @@ export component MainWindow inherits Window {
                     }
 
                     rta := TouchArea {
+                        property <bool> ctrl-down;
+                        property <bool> dragged;
                         pointer-event(ev) => {
                             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
-                                root.row-clicked(i, ev.modifiers.control);
+                                self.ctrl-down = ev.modifiers.control;
+                                self.dragged = false;
+                                root.drag-active = false;
+                                // A plain press keeps a selection that contains the
+                                // row, so several rows can be dragged together.
+                                if (ev.modifiers.control) {
+                                    root.row-clicked(i, true);
+                                } else {
+                                    root.row-context(i);
+                                }
                             } else if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
                                 // Selects the row unless it is already part of the selection.
                                 root.row-context(i);
                                 cma.show({ x: self.mouse-x, y: self.mouse-y });
+                            } else if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left) {
+                                root.end-drag();
+                            }
+                        }
+                        moved => {
+                            if (self.pressed) {
+                                root.drag-x = self.absolute-position.x + self.mouse-x;
+                                root.drag-y = self.absolute-position.y + self.mouse-y;
+                                if (!self.dragged && root.in-bucket && (abs((self.mouse-x - self.pressed-x) / 1px) > 8 || abs((self.mouse-y - self.pressed-y) / 1px) > 8)) {
+                                    self.dragged = true;
+                                    root.drag-from-local = false;
+                                    root.drag-started(false);
+                                    root.drag-active = true;
+                                }
+                            }
+                        }
+                        clicked => {
+                            if (!self.ctrl-down && !self.dragged) {
+                                root.row-clicked(i, false);
                             }
                         }
                         double-clicked => {
@@ -728,6 +798,167 @@ export component MainWindow inherits Window {
                 }
             }
         }
+
+        // Handle that hides or shows the local pane
+        Rectangle {
+            width: 14px;
+            background: lha.has-hover ? Palette.control-background : Palette.alternate-background;
+            Text {
+                text: root.local-open ? "›" : "‹";
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                font-size: 16px;
+            }
+
+            lha := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.local-open = !root.local-open;
+                }
+            }
+        }
+
+        // Local folder pane
+        if root.local-open: Rectangle {
+            width: root.local-width;
+            background: Palette.alternate-background;
+            VerticalLayout {
+                padding: 8px;
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: "Local";
+                        font-weight: 700;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+
+                    IconButton {
+                        icon: @image-url("icons/up.svg");
+                        tooltip: "Up";
+                        clicked => {
+                            root.local-up();
+                        }
+                    }
+
+                    IconButton {
+                        icon: @image-url("icons/refresh.svg");
+                        tooltip: "Refresh";
+                        clicked => {
+                            root.local-refresh();
+                        }
+                    }
+
+                    IconButton {
+                        icon: @image-url("icons/folder.svg");
+                        tooltip: "Choose folder";
+                        clicked => {
+                            root.local-choose();
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.local-path;
+                    font-size: 11px;
+                    overflow: elide;
+                    opacity: 0.7;
+                }
+
+                ListView {
+                    vertical-stretch: 1;
+                    for entry[i] in root.local-entries: Rectangle {
+                        height: 26px;
+                        border-radius: 3px;
+                        background: entry.selected ? Palette.selection-background : lta.has-hover ? Palette.control-background : transparent;
+                        lta := TouchArea {
+                            property <bool> ctrl-down;
+                            property <bool> dragged;
+                            pointer-event(ev) => {
+                                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                                    self.ctrl-down = ev.modifiers.control;
+                                    self.dragged = false;
+                                    root.drag-active = false;
+                                    if (ev.modifiers.control) {
+                                        root.local-row-clicked(i, true);
+                                    } else {
+                                        root.local-row-context(i);
+                                    }
+                                } else if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left) {
+                                    root.end-drag();
+                                }
+                            }
+                            moved => {
+                                if (self.pressed) {
+                                    root.drag-x = self.absolute-position.x + self.mouse-x;
+                                    root.drag-y = self.absolute-position.y + self.mouse-y;
+                                    if (!self.dragged && (abs((self.mouse-x - self.pressed-x) / 1px) > 8 || abs((self.mouse-y - self.pressed-y) / 1px) > 8)) {
+                                        self.dragged = true;
+                                        root.drag-from-local = true;
+                                        root.drag-started(true);
+                                        root.drag-active = true;
+                                    }
+                                }
+                            }
+                            clicked => {
+                                if (!self.ctrl-down && !self.dragged) {
+                                    root.local-row-clicked(i, false);
+                                }
+                            }
+                            double-clicked => {
+                                root.local-row-activated(i);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                EntryIcon {
+                                    is-dir: entry.is-dir;
+                                }
+                            }
+
+                            Text {
+                                text: entry.name;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                color: entry.selected ? Palette.selection-foreground : Palette.foreground;
+                            }
+
+                            Text {
+                                text: entry.size;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                                color: entry.selected ? Palette.selection-foreground : Palette.foreground;
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.local-status;
+                    font-size: 11px;
+                    overflow: elide;
+                    opacity: 0.7;
+                }
+            }
+        }
+    }
+
+    // Drop target highlight while dragging
+    if root.over-local || root.over-remote: Rectangle {
+        x: root.over-local ? root.width - root.local-width : root.main-left;
+        y: 0px;
+        width: root.over-local ? root.local-width : root.local-left - root.main-left;
+        height: root.height;
+        border-width: 2px;
+        border-color: Palette.accent-background;
+        background: #4080ff22;
     }
 
     if root.preview-open: Rectangle {
@@ -942,6 +1173,19 @@ export component MainWindow inherits Window {
                     root.confirm-accepted();
                 }
             }
+        }
+    }
+
+    if root.drag-active: Rectangle {
+        x: min(root.width - self.width - 4px, root.drag-x + 14px);
+        y: min(root.height - self.height - 4px, root.drag-y + 14px);
+        width: drag-text.preferred-width + 16px;
+        height: drag-text.preferred-height + 8px;
+        border-radius: 4px;
+        background: Palette.accent-background;
+        drag-text := Text {
+            text: root.drag-label;
+            color: Palette.accent-foreground;
         }
     }
 
