@@ -203,6 +203,15 @@ pub async fn list_all(client: &Client, bucket: &str, prefix: &str) -> Result<Vec
     Ok(out)
 }
 
+/// Whether an object exists at `key`.
+pub async fn object_exists(client: &Client, bucket: &str, key: &str) -> Result<bool> {
+    match client.head_object().bucket(bucket).key(key).send().await {
+        Ok(_) => Ok(true),
+        Err(e) if e.as_service_error().is_some_and(|s| s.is_not_found()) => Ok(false),
+        Err(e) => Err(sdk_err(&format!("check {key}"), e)),
+    }
+}
+
 /// Reads a whole object into memory.
 pub async fn get_bytes(client: &Client, bucket: &str, key: &str) -> Result<Vec<u8>> {
     let resp = client

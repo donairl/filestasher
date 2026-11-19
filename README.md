@@ -19,8 +19,11 @@ Cloudflare R2, Wasabi, and others), written in Rust with a
 - Image preview: double-click a PNG, JPEG, GIF, BMP, WebP or ICO file.
 - Right-click menu on the file list: open, preview, download, copy the path or
   the `s3://` URI to the clipboard.
-- Local folder pane on the right, which can be hidden. Drag files and folders
-  from it onto the S3 list to upload, or from the S3 list onto it to download.
+- Local folder pane on the right, with sortable columns, image preview and a
+  right-click menu. Drag files and folders from it onto the S3 list to upload,
+  or from the S3 list onto it to download.
+- Both side panels can be hidden, and resized by dragging their handles.
+- Asks before overwriting when a file already exists at the destination.
 - Create folders.
 - Delete files and folders, always after a confirmation.
 - Transfer progress in the status bar.

@@ -81,6 +81,96 @@ struct LocalEntry {
     path: PathBuf,
     is_dir: bool,
     size: u64,
+    modified: Option<i64>,
+}
+
+/// One file of a transfer, in either direction.
+struct TransferFile {
+    local: PathBuf,
+    key: String,
+    size: u64,
+    /// The destination already has this file.
+    exists: bool,
+}
+
+enum TransferKind {
+    Download { dest: PathBuf },
+    Upload { prefix: String },
+}
+
+/// A planned upload or download, ready to run.
+struct Transfer {
+    tab_id: u64,
+    client: Client,
+    bucket: String,
+    kind: TransferKind,
+    files: Vec<TransferFile>,
+    /// Keys left out of a download because they map to no safe local path.
+    skipped_unsafe: usize,
+}
+
+impl Transfer {
+    /// Question shown before overwriting.
+    fn conflict_text(&self) -> String {
+        let names: Vec<&str> = self
+            .files
+            .iter()
+            .filter(|f| f.exists)
+            .map(|f| match &self.kind {
+                TransferKind::Download { .. } => f
+                    .local
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&f.key),
+                TransferKind::Upload { prefix } => f.key.strip_prefix(prefix).unwrap_or(&f.key),
+            })
+            .collect();
+        let place = match &self.kind {
+            TransferKind::Download { dest } => dest.display().to_string(),
+            TransferKind::Upload { prefix } => format!("s3://{}/{prefix}", self.bucket),
+        };
+        let mut text = format!(
+            "{} of {} file(s) already exist in {place}:\n",
+            names.len(),
+            self.files.len()
+        );
+        for name in names.iter().take(5) {
+            text.push_str(&format!("\n  {name}"));
+        }
+        if names.len() > 5 {
+            text.push_str(&format!("\n  … and {} more", names.len() - 5));
+        }
+        text
+    }
+
+    /// Transfers every file, in order. Returns the file count.
+    async fn run(&self) -> Result<usize> {
+        let job = Job::start(self.files.iter().map(|f| f.size).sum());
+        for f in &self.files {
+            let progress = |n| job.add(n);
+            match self.kind {
+                TransferKind::Download { .. } => {
+                    s3::download_file(&self.client, &self.bucket, &f.key, &f.local, &progress)
+                        .await?
+                }
+                TransferKind::Upload { .. } => {
+                    s3::upload_file(&self.client, &self.bucket, &f.key, &f.local, &progress)
+                        .await?
+                }
+            }
+        }
+        Ok(self.files.len())
+    }
+}
+
+/// Where a previewed image comes from.
+enum PreviewSource {
+    Remote {
+        client: Client,
+        bucket: String,
+        key: String,
+    },
+    Local(PathBuf),
 }
 
 enum Pending {
@@ -110,11 +200,14 @@ struct State {
     preview_generation: u64,
     /// Order of every tab's listing.
     sort: SortOrder,
+    /// Transfer waiting for the answer to the overwrite question.
+    pending_transfer: Option<Transfer>,
     /// Folder shown in the local pane, with its listing and selection.
     local_dir: PathBuf,
     local_entries: Vec<LocalEntry>,
     local_selected: Vec<bool>,
     local_status: String,
+    local_sort: SortOrder,
     /// Bumped per local listing; older results are dropped.
     local_generation: u64,
     /// For each row on screen, its index in the active tab's entries. Differs
@@ -145,33 +238,103 @@ impl Default for SortOrder {
     }
 }
 
+/// What a listing row needs to be sorted: S3 entries and local files alike.
+trait Sortable {
+    fn is_dir(&self) -> bool;
+    fn name(&self) -> &str;
+    fn size(&self) -> u64;
+    fn modified(&self) -> Option<i64>;
+}
+
+impl Sortable for Entry {
+    fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn modified(&self) -> Option<i64> {
+        self.modified
+    }
+}
+
+impl Sortable for LocalEntry {
+    fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn modified(&self) -> Option<i64> {
+        self.modified
+    }
+}
+
 impl SortOrder {
     /// Folders always come before files. Ties fall back to the name.
-    fn compare(self, a: &Entry, b: &Entry) -> std::cmp::Ordering {
+    fn compare<T: Sortable>(self, a: &T, b: &T) -> std::cmp::Ordering {
         let by_column = match self.column {
-            SortColumn::Name => a.name.cmp(&b.name),
-            SortColumn::Size => a.size.cmp(&b.size),
-            SortColumn::Modified => a.modified.cmp(&b.modified),
+            SortColumn::Name => a.name().cmp(b.name()),
+            SortColumn::Size => a.size().cmp(&b.size()),
+            SortColumn::Modified => a.modified().cmp(&b.modified()),
         };
         let by_column = if self.descending {
             by_column.reverse()
         } else {
             by_column
         };
-        b.is_dir
-            .cmp(&a.is_dir)
+        b.is_dir()
+            .cmp(&a.is_dir())
             .then(by_column)
-            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.name().cmp(b.name()))
     }
 
     /// Sorts a listing, keeping each entry's selection flag with it.
-    fn apply(self, entries: &mut Vec<Entry>, selected: &mut Vec<bool>) {
-        let mut rows: Vec<(Entry, bool)> = std::mem::take(entries)
+    fn apply<T: Sortable>(self, entries: &mut Vec<T>, selected: &mut Vec<bool>) {
+        let mut rows: Vec<(T, bool)> = std::mem::take(entries)
             .into_iter()
             .zip(std::mem::take(selected))
             .collect();
         rows.sort_by(|a, b| self.compare(&a.0, &b.0));
         (*entries, *selected) = rows.into_iter().unzip();
+    }
+
+    /// Header click: a new column starts in its natural direction, the
+    /// current column flips.
+    fn clicked(self, column: SortColumn) -> SortOrder {
+        SortOrder {
+            column,
+            descending: if self.column == column {
+                !self.descending
+            } else {
+                column != SortColumn::Name
+            },
+        }
+    }
+
+    /// Column number used by the UI.
+    fn column_index(self) -> i32 {
+        match self.column {
+            SortColumn::Name => 0,
+            SortColumn::Size => 1,
+            SortColumn::Modified => 2,
+        }
+    }
+}
+
+impl SortColumn {
+    fn from_index(index: i32) -> SortColumn {
+        match index {
+            0 => SortColumn::Name,
+            1 => SortColumn::Size,
+            _ => SortColumn::Modified,
+        }
     }
 }
 
@@ -305,11 +468,7 @@ impl App {
         let titles: Vec<SharedString> = st.tabs.iter().map(|t| t.title.as_str().into()).collect();
         ui.set_tabs(ModelRc::new(VecModel::from(titles)));
         ui.set_active_tab(st.active.map_or(-1, |i| i as i32));
-        ui.set_sort_column(match st.sort.column {
-            SortColumn::Name => 0,
-            SortColumn::Size => 1,
-            SortColumn::Modified => 2,
-        });
+        ui.set_sort_column(st.sort.column_index());
         ui.set_sort_descending(st.sort.descending);
         match st.active_tab() {
             Some(t) => {
@@ -789,17 +948,7 @@ impl App {
     fn sort_by(&self, column: SortColumn) {
         {
             let mut st = self.state.borrow_mut();
-            st.sort = if st.sort.column == column {
-                SortOrder {
-                    column,
-                    descending: !st.sort.descending,
-                }
-            } else {
-                SortOrder {
-                    column,
-                    descending: column != SortColumn::Name,
-                }
-            };
+            st.sort = st.sort.clicked(column);
             let sort = st.sort;
             for t in &mut st.tabs {
                 sort.apply(&mut t.entries, &mut t.selected);
@@ -918,12 +1067,11 @@ impl App {
     }
 
     /// Opens the preview overlay and loads the image in the background.
-    fn preview(&self, client: Client, bucket: String, entry: Entry) {
-        if entry.size > MAX_PREVIEW_BYTES {
+    fn preview(&self, name: String, size: u64, source: PreviewSource) {
+        if size > MAX_PREVIEW_BYTES {
             return self.notify(format!(
-                "{} is too large to preview ({}).",
-                entry.name,
-                format_size(entry.size)
+                "{name} is too large to preview ({}).",
+                format_size(size)
             ));
         }
         let generation = {
@@ -932,13 +1080,13 @@ impl App {
             st.preview_generation
         };
         let ui = self.ui();
-        ui.set_preview_title(entry.name.as_str().into());
+        ui.set_preview_title(name.into());
         ui.set_preview_info(SharedString::new());
         ui.set_preview_message("Loading…".into());
         ui.set_preview_image(slint::Image::default());
         ui.set_preview_open(true);
         self.rt.spawn(async move {
-            let result = load_preview(&client, &bucket, &entry.key).await;
+            let result = load_preview(source).await;
             on_ui(move |app| {
                 let ui = app.ui();
                 // Closed, or replaced by a newer preview.
@@ -949,7 +1097,7 @@ impl App {
                     Ok((pixels, width, height)) => {
                         ui.set_preview_image(slint::Image::from_rgba8(pixels));
                         ui.set_preview_info(
-                            format!("{width} × {height} · {}", format_size(entry.size)).into(),
+                            format!("{width} × {height} · {}", format_size(size)).into(),
                         );
                         ui.set_preview_message(SharedString::new());
                     }
@@ -978,7 +1126,15 @@ impl App {
                 };
                 drop(st);
                 if let Some((client, bucket, entry)) = target {
-                    self.preview(client, bucket, entry);
+                    self.preview(
+                        entry.name,
+                        entry.size,
+                        PreviewSource::Remote {
+                            client,
+                            bucket,
+                            key: entry.key,
+                        },
+                    );
                 }
                 return;
             }
@@ -1054,24 +1210,8 @@ impl App {
                     dir.path().to_path_buf()
                 }
             };
-            let result = download_items(&client, &bucket, &items, &dest).await;
-            on_ui(move |app| {
-                app.set_status(
-                    tab_id,
-                    match result {
-                        Ok((n, 0)) => format!("Downloaded {n} file(s) to {}", dest.display()),
-                        Ok((n, skipped)) => format!(
-                            "Downloaded {n} file(s) to {}, skipped {skipped} with unsafe names.",
-                            dest.display()
-                        ),
-                        Err(e) => format!("Download failed: {e:#}"),
-                    },
-                );
-                // Show the new files when they landed in the local pane's folder.
-                if app.state.borrow().local_dir == dest {
-                    app.local_load();
-                }
-            });
+            let plan = plan_download(tab_id, client, bucket, &items, dest).await;
+            on_ui(move |app| app.transfer_planned(tab_id, plan));
         });
     }
 
@@ -1084,17 +1224,80 @@ impl App {
             return;
         }
         self.rt.spawn(async move {
-            let result = upload_files(&client, &bucket, &prefix, paths).await;
+            let plan = plan_upload(tab_id, client, bucket, prefix, paths).await;
+            on_ui(move |app| app.transfer_planned(tab_id, plan));
+        });
+    }
+
+    /// Starts a planned transfer, or asks first when it would overwrite files.
+    fn transfer_planned(&self, tab_id: u64, plan: Result<Transfer>) {
+        let plan = match plan {
+            Ok(p) => p,
+            Err(e) => return self.set_status(tab_id, format!("Error: {e:#}")),
+        };
+        if !plan.files.iter().any(|f| f.exists) {
+            return self.run_transfer(plan, 0);
+        }
+        let text = plan.conflict_text();
+        self.state.borrow_mut().pending_transfer = Some(plan);
+        let ui = self.ui();
+        ui.set_conflict_text(text.into());
+        ui.set_conflict_open(true);
+    }
+
+    /// Answer to the overwrite question: 0 overwrite, 1 skip existing files,
+    /// anything else cancels.
+    fn conflict_choice(&self, choice: i32) {
+        let Some(mut plan) = self.state.borrow_mut().pending_transfer.take() else {
+            return;
+        };
+        let mut skipped = 0;
+        match choice {
+            0 => {}
+            1 => {
+                let before = plan.files.len();
+                plan.files.retain(|f| !f.exists);
+                skipped = before - plan.files.len();
+            }
+            _ => return self.set_status(plan.tab_id, "Cancelled, nothing was transferred.".into()),
+        }
+        self.run_transfer(plan, skipped);
+    }
+
+    /// `skipped_existing` is only reported in the final status.
+    fn run_transfer(&self, plan: Transfer, skipped_existing: usize) {
+        self.rt.spawn(async move {
+            let result = plan.run().await;
             on_ui(move |app| {
-                app.set_status(
-                    tab_id,
-                    match &result {
-                        Ok(n) => format!("Uploaded {n} file(s)."),
-                        Err(e) => format!("Upload failed: {e:#}"),
-                    },
-                );
-                // A failed batch may still have stored some files.
-                app.reload_if_at(tab_id, &bucket, &prefix);
+                let mut msg = match (&result, &plan.kind) {
+                    (Ok(n), TransferKind::Download { dest }) => {
+                        format!("Downloaded {n} file(s) to {}", dest.display())
+                    }
+                    (Ok(n), TransferKind::Upload { .. }) => format!("Uploaded {n} file(s)"),
+                    (Err(e), TransferKind::Download { .. }) => format!("Download failed: {e:#}"),
+                    (Err(e), TransferKind::Upload { .. }) => format!("Upload failed: {e:#}"),
+                };
+                if skipped_existing > 0 {
+                    msg.push_str(&format!(", skipped {skipped_existing} existing"));
+                }
+                if plan.skipped_unsafe > 0 {
+                    msg.push_str(&format!(
+                        ", skipped {} with unsafe names",
+                        plan.skipped_unsafe
+                    ));
+                }
+                app.set_status(plan.tab_id, msg);
+                // A failed batch may still have transferred some files.
+                match &plan.kind {
+                    TransferKind::Download { dest } => {
+                        if app.state.borrow().local_dir == *dest {
+                            app.local_load();
+                        }
+                    }
+                    TransferKind::Upload { prefix } => {
+                        app.reload_if_at(plan.tab_id, &plan.bucket, prefix);
+                    }
+                }
             });
         });
     }
@@ -1106,6 +1309,8 @@ impl App {
         let ui = self.ui();
         ui.set_local_path(st.local_dir.display().to_string().into());
         ui.set_local_status(st.local_status.as_str().into());
+        ui.set_local_sort_column(st.local_sort.column_index());
+        ui.set_local_sort_descending(st.local_sort.descending);
         let rows: Vec<FileEntry> = st
             .local_entries
             .iter()
@@ -1113,13 +1318,13 @@ impl App {
             .map(|(e, sel)| FileEntry {
                 name: e.name.as_str().into(),
                 is_dir: e.is_dir,
-                is_image: false,
+                is_image: !e.is_dir && is_image(&e.name),
                 size: if e.is_dir {
                     SharedString::new()
                 } else {
                     format_size(e.size).into()
                 },
-                modified: SharedString::new(),
+                modified: e.modified.map(format_time).unwrap_or_default().into(),
                 selected: *sel,
             })
             .collect();
@@ -1146,6 +1351,9 @@ impl App {
                             st.local_status = format!("{} item(s)", entries.len());
                             st.local_selected = vec![false; entries.len()];
                             st.local_entries = entries;
+                            let st = &mut *st;
+                            st.local_sort
+                                .apply(&mut st.local_entries, &mut st.local_selected);
                         }
                         Err(e) => {
                             st.local_status = format!("Error: {e:#}");
@@ -1157,6 +1365,17 @@ impl App {
                 app.sync_local();
             });
         });
+    }
+
+    fn local_sort_by(&self, column: SortColumn) {
+        {
+            let mut st = self.state.borrow_mut();
+            let st = &mut *st;
+            st.local_sort = st.local_sort.clicked(column);
+            st.local_sort
+                .apply(&mut st.local_entries, &mut st.local_selected);
+        }
+        self.sync_local();
     }
 
     fn local_open_dir(&self, dir: PathBuf) {
@@ -1219,14 +1438,14 @@ impl App {
     }
 
     fn local_row_activated(&self, index: usize) {
-        let dir = {
-            let st = self.state.borrow();
-            match st.local_entries.get(index) {
-                Some(e) if e.is_dir => e.path.clone(),
-                _ => return,
-            }
+        let Some(entry) = self.state.borrow().local_entries.get(index).cloned() else {
+            return;
         };
-        self.local_open_dir(dir);
+        if entry.is_dir {
+            self.local_open_dir(entry.path);
+        } else if is_image(&entry.name) {
+            self.preview(entry.name, entry.size, PreviewSource::Local(entry.path));
+        }
     }
 
     // ---- Drag and drop ---------------------------------------------------
@@ -1407,8 +1626,8 @@ fn count_status(count: usize, has_more: bool) -> String {
 
 // ---- Background work -------------------------------------------------------
 
-/// Lists a local folder: folders first, then by name. Hidden entries (names
-/// starting with a dot) are left out.
+/// Lists a local folder, unsorted. Hidden entries (names starting with a dot)
+/// are left out.
 fn read_local_dir(dir: &std::path::Path) -> Result<Vec<LocalEntry>> {
     let mut out = Vec::new();
     for item in std::fs::read_dir(dir)? {
@@ -1426,9 +1645,13 @@ fn read_local_dir(dir: &std::path::Path) -> Result<Vec<LocalEntry>> {
             path: item.path(),
             is_dir: meta.is_dir(),
             size: meta.len(),
+            modified: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64),
         });
     }
-    out.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
     Ok(out)
 }
 
@@ -1467,67 +1690,125 @@ fn collect_uploads(paths: &[PathBuf], prefix: &str) -> Result<Vec<(PathBuf, Stri
     Ok(out)
 }
 
-/// Uploads files and whole folders under `prefix`. Returns the file count.
-async fn upload_files(
-    client: &Client,
-    bucket: &str,
-    prefix: &str,
+/// Plans an upload of files and whole folders under `prefix`, and finds
+/// which objects already exist.
+async fn plan_upload(
+    tab_id: u64,
+    client: Client,
+    bucket: String,
+    prefix: String,
     paths: Vec<PathBuf>,
-) -> Result<usize> {
-    let prefix_owned = prefix.to_string();
-    let files =
-        tokio::task::spawn_blocking(move || collect_uploads(&paths, &prefix_owned)).await??;
-    let job = Job::start(files.iter().map(|f| f.2).sum());
-    for (path, key, _) in &files {
-        s3::upload_file(client, bucket, key, path, &|n| job.add(n)).await?;
+) -> Result<Transfer> {
+    let (uploads, tops) = {
+        let prefix = prefix.clone();
+        tokio::task::spawn_blocking(move || {
+            // Top-level targets: (key, is a folder).
+            let tops: Vec<(String, bool)> = paths
+                .iter()
+                .filter_map(|p| {
+                    let name = p.file_name()?.to_str()?;
+                    Some((format!("{prefix}{name}"), p.is_dir()))
+                })
+                .collect();
+            collect_uploads(&paths, &prefix).map(|u| (u, tops))
+        })
+        .await??
+    };
+    // One request per top-level item: a listing for folders, a HEAD for files.
+    let mut existing = std::collections::HashSet::new();
+    for (key, is_dir) in tops {
+        if is_dir {
+            let under = s3::list_all(&client, &bucket, &format!("{key}/")).await?;
+            existing.extend(under.into_iter().map(|(k, _)| k));
+        } else if s3::object_exists(&client, &bucket, &key).await? {
+            existing.insert(key);
+        }
     }
-    Ok(files.len())
+    let files = uploads
+        .into_iter()
+        .map(|(local, key, size)| TransferFile {
+            exists: existing.contains(&key),
+            local,
+            key,
+            size,
+        })
+        .collect();
+    Ok(Transfer {
+        tab_id,
+        client,
+        bucket,
+        kind: TransferKind::Upload { prefix },
+        files,
+        skipped_unsafe: 0,
+    })
 }
 
-/// Returns (files downloaded, keys skipped because they map to no safe path).
-async fn download_items(
-    client: &Client,
-    bucket: &str,
+/// Plans a download of entries into `dest`, folders recursively, and finds
+/// which local files already exist.
+async fn plan_download(
+    tab_id: u64,
+    client: Client,
+    bucket: String,
     items: &[Entry],
-    dest: &std::path::Path,
-) -> Result<(usize, usize)> {
+    dest: PathBuf,
+) -> Result<Transfer> {
     // (key, path relative to dest, size)
-    let mut files: Vec<(String, String, u64)> = Vec::new();
+    let mut found: Vec<(String, String, u64)> = Vec::new();
     for item in items {
         if !item.is_dir {
-            files.push((item.key.clone(), item.name.clone(), item.size));
+            found.push((item.key.clone(), item.name.clone(), item.size));
             continue;
         }
-        for (key, size) in s3::list_all(client, bucket, &item.key).await? {
+        for (key, size) in s3::list_all(&client, &bucket, &item.key).await? {
             // Folder marker objects have nothing to download.
             if key.ends_with('/') {
                 continue;
             }
             let rest = key.strip_prefix(&item.key).unwrap_or(&key);
-            files.push((key.clone(), format!("{}/{rest}", item.name), size));
+            found.push((key.clone(), format!("{}/{rest}", item.name), size));
         }
     }
-    let job = Job::start(files.iter().map(|f| f.2).sum());
-    let (mut count, mut skipped) = (0, 0);
-    for (key, rel, _) in &files {
-        let Some(path) = safe_join(dest, rel) else {
-            skipped += 1;
-            continue;
-        };
-        s3::download_file(client, bucket, key, &path, &|n| job.add(n)).await?;
-        count += 1;
-    }
-    Ok((count, skipped))
+    let base = dest.clone();
+    let (files, skipped_unsafe) = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        let mut skipped = 0;
+        for (key, rel, size) in found {
+            match safe_join(&base, &rel) {
+                Some(local) => files.push(TransferFile {
+                    exists: local.exists(),
+                    local,
+                    key,
+                    size,
+                }),
+                None => skipped += 1,
+            }
+        }
+        (files, skipped)
+    })
+    .await?;
+    Ok(Transfer {
+        tab_id,
+        client,
+        bucket,
+        kind: TransferKind::Download { dest },
+        files,
+        skipped_unsafe,
+    })
 }
 
-/// Downloads and decodes an image. Returns the pixels and the original size;
+/// Reads and decodes an image. Returns the pixels and the original size;
 /// large images are scaled down to [`MAX_PREVIEW_SIDE`].
 async fn load_preview(
-    client: &Client,
-    bucket: &str,
-    key: &str,
+    source: PreviewSource,
 ) -> Result<(slint::SharedPixelBuffer<slint::Rgba8Pixel>, u32, u32)> {
-    let bytes = s3::get_bytes(client, bucket, key).await?;
+    let bytes = match source {
+        PreviewSource::Remote {
+            client,
+            bucket,
+            key,
+        } => s3::get_bytes(&client, &bucket, &key).await?,
+        PreviewSource::Local(path) => tokio::fs::read(&path).await?,
+    };
     tokio::task::spawn_blocking(move || {
         let img = image::load_from_memory(&bytes)?;
         let (width, height) = (img.width(), img.height());
@@ -1613,16 +1894,16 @@ fn main() -> Result<()> {
     ui.on_refresh(|| with_app(|a| a.refresh()));
     ui.on_load_more(|| with_app(|a| a.load_more()));
     ui.on_search_changed(|text| with_app(|a| a.search_changed(&text)));
-    ui.on_sort_by(|column| {
-        let column = match column {
-            0 => SortColumn::Name,
-            1 => SortColumn::Size,
-            _ => SortColumn::Modified,
-        };
-        with_app(|a| a.sort_by(column));
-    });
+    ui.on_sort_by(|column| with_app(|a| a.sort_by(SortColumn::from_index(column))));
+    ui.on_local_sort_by(|column| with_app(|a| a.local_sort_by(SortColumn::from_index(column))));
     ui.on_upload(|| with_app(|a| a.upload()));
     ui.on_download(|| with_app(|a| a.download()));
+    ui.on_download_local(|| {
+        with_app(|a| {
+            let dest = a.state.borrow().local_dir.clone();
+            a.download_to(Some(dest));
+        })
+    });
     ui.on_delete_selected(|| with_app(|a| a.ask_delete_selected()));
     ui.on_create_folder(|name| with_app(|a| a.create_folder(&name)));
     ui.on_row_clicked(|i, toggle| with_app(|a| a.row_clicked(i as usize, toggle)));
@@ -1637,6 +1918,7 @@ fn main() -> Result<()> {
     ui.on_local_row_activated(|i| with_app(|a| a.local_row_activated(i as usize)));
     ui.on_drag_started(|from_local| with_app(|a| a.drag_started(from_local)));
     ui.on_dropped(|from_local| with_app(|a| a.dropped(from_local)));
+    ui.on_conflict_choice(|choice| with_app(|a| a.conflict_choice(choice)));
     ui.on_confirm_accepted(|| with_app(|a| a.confirm_accepted()));
 
     ui.run()?;
@@ -1683,12 +1965,19 @@ mod tests {
         std::fs::write(root.join("docs/one.md"), b"12").unwrap();
         std::fs::write(root.join("docs/sub/two.md"), b"123").unwrap();
 
-        let listing = read_local_dir(root).unwrap();
+        let mut listing = read_local_dir(root).unwrap();
+        let mut selected = vec![false; listing.len()];
+        SortOrder {
+            column: SortColumn::Name,
+            descending: false,
+        }
+        .apply(&mut listing, &mut selected);
         let names: Vec<&str> = listing.iter().map(|e| e.name.as_str()).collect();
-        // Folders first, case-insensitive order, hidden files left out.
+        // Folders first, hidden files left out.
         assert_eq!(names, ["docs", "A.txt", "b.txt"]);
         assert!(listing[0].is_dir);
         assert_eq!(listing[2].size, 5);
+        assert!(listing[2].modified.is_some());
 
         let mut uploads =
             collect_uploads(&[root.join("docs"), root.join("b.txt")], "base/").unwrap();
@@ -1701,6 +1990,30 @@ mod tests {
                 ("base/docs/one.md", 2),
                 ("base/docs/sub/two.md", 3)
             ]
+        );
+    }
+
+    #[test]
+    fn conflict_question() {
+        let file = |key: &str, exists| TransferFile {
+            local: PathBuf::from("/src").join(key),
+            key: format!("base/{key}"),
+            size: 1,
+            exists,
+        };
+        let plan = Transfer {
+            tab_id: 1,
+            client: s3::build_client(&ServerProfile::default()),
+            bucket: "bkt".into(),
+            kind: TransferKind::Upload {
+                prefix: "base/".into(),
+            },
+            files: vec![file("a.txt", true), file("d/b.txt", true), file("c.txt", false)],
+            skipped_unsafe: 0,
+        };
+        assert_eq!(
+            plan.conflict_text(),
+            "2 of 3 file(s) already exist in s3://bkt/base/:\n\n  a.txt\n  d/b.txt"
         );
     }
 

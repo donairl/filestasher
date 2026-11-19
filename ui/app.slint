@@ -172,7 +172,7 @@ component EntryIcon inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: "S3 FStasher";
-    preferred-width: 1320px;
+    preferred-width: 1420px;
     preferred-height: 660px;
     min-width: 760px;
     min-height: 440px;
@@ -212,6 +212,8 @@ export component MainWindow inherits Window {
     callback refresh();
     callback upload();
     callback download();
+    // Downloads the selection into the local pane's folder, without asking.
+    callback download-local();
     callback delete-selected();
     callback create-folder(string);
     callback row-clicked(int, bool);
@@ -238,6 +240,9 @@ export component MainWindow inherits Window {
     callback local-row-clicked(int, bool);
     callback local-row-context(int);
     callback local-row-activated(int);
+    in property <int> local-sort-column: 2;
+    in property <bool> local-sort-descending: true;
+    callback local-sort-by(int);
 
     // Drag and drop between the S3 list and the local pane
     in property <string> drag-label;
@@ -249,9 +254,16 @@ export component MainWindow inherits Window {
     property <bool> drag-from-local;
     property <length> drag-x;
     property <length> drag-y;
-    property <length> local-width: 320px;
+    property <length> local-width: 420px;
     // Left edges of the S3 area and of the local pane with its handle.
-    property <length> main-left: (root.sidebar-open ? 230px : 0px) + 14px;
+    property <length> main-left: (root.sidebar-open ? root.sidebar-width : 0px) + 14px;
+    // Panel widths, changed by dragging the handles. Each panel may grow
+    // until the file list in the middle is down to its minimum.
+    property <length> sidebar-width: 230px;
+    property <length> panel-min: 160px;
+    property <length> middle-min: 420px;
+    property <length> sidebar-max: max(root.panel-min, root.width - 28px - root.middle-min - (root.local-open ? root.local-width : 0px));
+    property <length> local-max: max(root.panel-min, root.width - 28px - root.middle-min - (root.sidebar-open ? root.sidebar-width : 0px));
     property <length> local-left: root.width - 14px - (root.local-open ? root.local-width : 0px);
     property <bool> over-local: root.drag-active && !root.drag-from-local && root.local-open && root.drag-x >= root.width - root.local-width;
     property <bool> over-remote: root.drag-active && root.drag-from-local && root.in-bucket && root.drag-x >= root.main-left && root.drag-x < root.local-left;
@@ -293,6 +305,11 @@ export component MainWindow inherits Window {
     in property <string> preview-message;
     in property <image> preview-image;
 
+    // Overwrite question: 0 overwrite, 1 skip existing, 2 cancel
+    in-out property <bool> conflict-open;
+    in property <string> conflict-text;
+    callback conflict-choice(int);
+
     // Confirm dialog
     in-out property <bool> confirm-open;
     in property <string> confirm-text;
@@ -311,7 +328,7 @@ export component MainWindow inherits Window {
     HorizontalLayout {
         // Sidebar
         if root.sidebar-open: Rectangle {
-            width: 230px;
+            width: root.sidebar-width;
             background: Palette.alternate-background;
             VerticalLayout {
                 padding: 8px;
@@ -414,10 +431,32 @@ export component MainWindow inherits Window {
                 font-size: 16px;
             }
 
+            // Click toggles the panel, dragging resizes it.
             hta := TouchArea {
-                mouse-cursor: pointer;
+                property <bool> dragged;
+                property <length> press-x;
+                property <length> pointer-x: self.absolute-position.x + self.mouse-x;
+                mouse-cursor: root.sidebar-open ? col-resize : pointer;
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                        self.dragged = false;
+                        self.press-x = self.pointer-x;
+                    }
+                }
+                moved => {
+                    if (self.pressed && root.sidebar-open) {
+                        if (abs((self.pointer-x - self.press-x) / 1px) > 3) {
+                            self.dragged = true;
+                        }
+                        if (self.dragged) {
+                            root.sidebar-width = max(root.panel-min, min(root.sidebar-max, self.pointer-x - 7px));
+                        }
+                    }
+                }
                 clicked => {
-                    root.sidebar-open = !root.sidebar-open;
+                    if (!self.dragged) {
+                        root.sidebar-open = !root.sidebar-open;
+                    }
                 }
             }
         }
@@ -673,7 +712,7 @@ export component MainWindow inherits Window {
                                 title: "Download";
                                 enabled: root.in-bucket;
                                 activated => {
-                                    root.download();
+                                    root.download-local();
                                 }
                             }
                         }
@@ -810,10 +849,32 @@ export component MainWindow inherits Window {
                 font-size: 16px;
             }
 
+            // Click toggles the pane, dragging resizes it.
             lha := TouchArea {
-                mouse-cursor: pointer;
+                property <bool> dragged;
+                property <length> press-x;
+                property <length> pointer-x: self.absolute-position.x + self.mouse-x;
+                mouse-cursor: root.local-open ? col-resize : pointer;
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                        self.dragged = false;
+                        self.press-x = self.pointer-x;
+                    }
+                }
+                moved => {
+                    if (self.pressed && root.local-open) {
+                        if (abs((self.pointer-x - self.press-x) / 1px) > 3) {
+                            self.dragged = true;
+                        }
+                        if (self.dragged) {
+                            root.local-width = max(root.panel-min, min(root.local-max, root.width - self.pointer-x - 7px));
+                        }
+                    }
+                }
                 clicked => {
-                    root.local-open = !root.local-open;
+                    if (!self.dragged) {
+                        root.local-open = !root.local-open;
+                    }
                 }
             }
         }
@@ -866,12 +927,78 @@ export component MainWindow inherits Window {
                     opacity: 0.7;
                 }
 
+                // Column header
+                HorizontalLayout {
+                    height: 24px;
+                    padding-left: 6px;
+                    padding-right: 22px;
+                    spacing: 8px;
+                    Rectangle {
+                        width: 16px;
+                    }
+
+                    HeaderCell {
+                        title: "Name";
+                        horizontal-stretch: 1;
+                        active: root.local-sort-column == 0;
+                        descending: root.local-sort-descending;
+                        clicked => {
+                            root.local-sort-by(0);
+                        }
+                    }
+
+                    HeaderCell {
+                        title: "Size";
+                        width: 72px;
+                        align-right: true;
+                        active: root.local-sort-column == 1;
+                        descending: root.local-sort-descending;
+                        clicked => {
+                            root.local-sort-by(1);
+                        }
+                    }
+
+                    HeaderCell {
+                        title: "Modified";
+                        width: 118px;
+                        active: root.local-sort-column == 2;
+                        descending: root.local-sort-descending;
+                        clicked => {
+                            root.local-sort-by(2);
+                        }
+                    }
+                }
+
                 ListView {
                     vertical-stretch: 1;
                     for entry[i] in root.local-entries: Rectangle {
                         height: 26px;
                         border-radius: 3px;
                         background: entry.selected ? Palette.selection-background : lta.has-hover ? Palette.control-background : transparent;
+                        lcma := ContextMenuArea {
+                            Menu {
+                                if entry.is-dir: MenuItem {
+                                    title: "Open";
+                                    activated => {
+                                        root.local-row-activated(i);
+                                    }
+                                }
+                                if entry.is-image: MenuItem {
+                                    title: "Preview";
+                                    activated => {
+                                        root.local-row-activated(i);
+                                    }
+                                }
+                                MenuItem {
+                                    title: "Upload";
+                                    enabled: root.in-bucket;
+                                    activated => {
+                                        root.dropped(true);
+                                    }
+                                }
+                            }
+                        }
+
                         lta := TouchArea {
                             property <bool> ctrl-down;
                             property <bool> dragged;
@@ -885,6 +1012,9 @@ export component MainWindow inherits Window {
                                     } else {
                                         root.local-row-context(i);
                                     }
+                                } else if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                                    root.local-row-context(i);
+                                    lcma.show({ x: self.mouse-x, y: self.mouse-y });
                                 } else if (ev.kind == PointerEventKind.up && ev.button == PointerEventButton.left) {
                                     root.end-drag();
                                 }
@@ -932,8 +1062,17 @@ export component MainWindow inherits Window {
 
                             Text {
                                 text: entry.size;
+                                width: 72px;
                                 horizontal-alignment: right;
                                 vertical-alignment: center;
+                                color: entry.selected ? Palette.selection-foreground : Palette.foreground;
+                            }
+
+                            Text {
+                                text: entry.modified;
+                                width: 118px;
+                                vertical-alignment: center;
+                                overflow: elide;
                                 color: entry.selected ? Palette.selection-foreground : Palette.foreground;
                             }
                         }
@@ -1138,6 +1277,46 @@ export component MainWindow inherits Window {
                 clicked => {
                     root.newfolder-open = false;
                     root.create-folder(root.newfolder-name);
+                }
+            }
+        }
+    }
+
+    if root.conflict-open: Modal {
+        title: "Files already exist";
+        box-width: 480px;
+        Text {
+            text: root.conflict-text;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+            Button {
+                text: "Cancel";
+                icon: @image-url("icons/close.svg");
+                colorize-icon: true;
+                clicked => {
+                    root.conflict-open = false;
+                    root.conflict-choice(2);
+                }
+            }
+
+            Button {
+                text: "Skip existing";
+                clicked => {
+                    root.conflict-open = false;
+                    root.conflict-choice(1);
+                }
+            }
+
+            Button {
+                text: "Overwrite";
+                primary: true;
+                clicked => {
+                    root.conflict-open = false;
+                    root.conflict-choice(0);
                 }
             }
         }
