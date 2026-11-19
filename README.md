@@ -13,6 +13,7 @@ Cloudflare R2, Wasabi, and others), written in Rust with a
 - Upload files, with multipart upload for files larger than 32 MiB.
 - Download files and whole folders.
 - Image preview: double-click a PNG, JPEG, GIF, BMP, WebP or ICO file.
+- Right-click menu on the file list: open, preview, download.
 - Create folders.
 - Delete files and folders, always after a confirmation.
 - Transfer progress in the status bar.

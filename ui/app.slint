@@ -8,6 +8,7 @@ export struct ServerItem {
 export struct FileEntry {
     name: string,
     is-dir: bool,
+    is-image: bool,
     size: string,
     modified: string,
     selected: bool,
@@ -117,6 +118,7 @@ export component MainWindow inherits Window {
     callback create-folder(string);
     callback row-clicked(int, bool);
     callback row-activated(int);
+    callback row-context(int);
 
     // Transfers
     in property <int> transfer-count;
@@ -205,6 +207,8 @@ export component MainWindow inherits Window {
 
                 Button {
                     text: "Connect";
+                    icon: @image-url("icons/connect.svg");
+                    colorize-icon: true;
                     primary: true;
                     enabled: root.selected-server >= 0;
                     clicked => {
@@ -216,6 +220,8 @@ export component MainWindow inherits Window {
                     spacing: 4px;
                     Button {
                         text: "Add";
+                        icon: @image-url("icons/add.svg");
+                        colorize-icon: true;
                         clicked => {
                             root.add-server();
                         }
@@ -223,6 +229,8 @@ export component MainWindow inherits Window {
 
                     Button {
                         text: "Edit";
+                        icon: @image-url("icons/edit.svg");
+                        colorize-icon: true;
                         enabled: root.selected-server >= 0;
                         clicked => {
                             root.edit-server(root.selected-server);
@@ -231,6 +239,8 @@ export component MainWindow inherits Window {
 
                     Button {
                         text: "Delete";
+                        icon: @image-url("icons/trash.svg");
+                        colorize-icon: true;
                         enabled: root.selected-server >= 0;
                         clicked => {
                             root.delete-server(root.selected-server);
@@ -327,7 +337,8 @@ export component MainWindow inherits Window {
                 padding: 6px;
                 spacing: 6px;
                 Button {
-                    text: "Up";
+                    icon: @image-url("icons/up.svg");
+                    colorize-icon: true;
                     enabled: root.in-bucket;
                     clicked => {
                         root.go-up();
@@ -335,7 +346,8 @@ export component MainWindow inherits Window {
                 }
 
                 Button {
-                    text: "Refresh";
+                    icon: @image-url("icons/refresh.svg");
+                    colorize-icon: true;
                     clicked => {
                         root.refresh();
                     }
@@ -350,6 +362,8 @@ export component MainWindow inherits Window {
 
                 Button {
                     text: "Upload";
+                    icon: @image-url("icons/upload.svg");
+                    colorize-icon: true;
                     enabled: root.in-bucket;
                     clicked => {
                         root.upload();
@@ -358,6 +372,8 @@ export component MainWindow inherits Window {
 
                 Button {
                     text: "Download";
+                    icon: @image-url("icons/download.svg");
+                    colorize-icon: true;
                     enabled: root.in-bucket;
                     clicked => {
                         root.download();
@@ -366,6 +382,8 @@ export component MainWindow inherits Window {
 
                 Button {
                     text: "New Folder";
+                    icon: @image-url("icons/folder-plus.svg");
+                    colorize-icon: true;
                     enabled: root.in-bucket;
                     clicked => {
                         root.newfolder-name = "";
@@ -375,6 +393,8 @@ export component MainWindow inherits Window {
 
                 Button {
                     text: "Delete";
+                    icon: @image-url("icons/trash.svg");
+                    colorize-icon: true;
                     enabled: root.in-bucket;
                     clicked => {
                         root.delete-selected();
@@ -423,10 +443,38 @@ export component MainWindow inherits Window {
                 for entry[i] in root.entries: Rectangle {
                     height: 28px;
                     background: entry.selected ? Palette.selection-background : rta.has-hover ? Palette.alternate-background : transparent;
+                    cma := ContextMenuArea {
+                        Menu {
+                            if entry.is-dir: MenuItem {
+                                title: "Open";
+                                activated => {
+                                    root.row-activated(i);
+                                }
+                            }
+                            if entry.is-image: MenuItem {
+                                title: "Preview";
+                                activated => {
+                                    root.row-activated(i);
+                                }
+                            }
+                            MenuItem {
+                                title: "Download";
+                                enabled: root.in-bucket;
+                                activated => {
+                                    root.download();
+                                }
+                            }
+                        }
+                    }
+
                     rta := TouchArea {
                         pointer-event(ev) => {
                             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
                                 root.row-clicked(i, ev.modifiers.control);
+                            } else if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.right) {
+                                // Selects the row unless it is already part of the selection.
+                                root.row-context(i);
+                                cma.show({ x: self.mouse-x, y: self.mouse-y });
                             }
                         }
                         double-clicked => {
@@ -542,6 +590,8 @@ export component MainWindow inherits Window {
 
                 Button {
                     text: "Close";
+                    icon: @image-url("icons/close.svg");
+                    colorize-icon: true;
                     clicked => {
                         root.preview-open = false;
                     }
@@ -621,6 +671,8 @@ export component MainWindow inherits Window {
             spacing: 6px;
             Button {
                 text: "Test Connection";
+                icon: @image-url("icons/pulse.svg");
+                colorize-icon: true;
                 clicked => {
                     root.test-server();
                 }
@@ -632,6 +684,8 @@ export component MainWindow inherits Window {
 
             Button {
                 text: "Cancel";
+                icon: @image-url("icons/close.svg");
+                colorize-icon: true;
                 clicked => {
                     root.server-dialog-open = false;
                 }
@@ -639,6 +693,8 @@ export component MainWindow inherits Window {
 
             Button {
                 text: "Save";
+                icon: @image-url("icons/check.svg");
+                colorize-icon: true;
                 primary: true;
                 clicked => {
                     root.save-server();
@@ -664,6 +720,8 @@ export component MainWindow inherits Window {
             alignment: end;
             Button {
                 text: "Cancel";
+                icon: @image-url("icons/close.svg");
+                colorize-icon: true;
                 clicked => {
                     root.newfolder-open = false;
                 }
@@ -671,6 +729,8 @@ export component MainWindow inherits Window {
 
             Button {
                 text: "Create";
+                icon: @image-url("icons/folder-plus.svg");
+                colorize-icon: true;
                 primary: true;
                 clicked => {
                     root.newfolder-open = false;
@@ -693,6 +753,8 @@ export component MainWindow inherits Window {
             alignment: end;
             Button {
                 text: "Cancel";
+                icon: @image-url("icons/close.svg");
+                colorize-icon: true;
                 clicked => {
                     root.confirm-open = false;
                 }
@@ -700,6 +762,8 @@ export component MainWindow inherits Window {
 
             Button {
                 text: "Delete";
+                icon: @image-url("icons/trash.svg");
+                colorize-icon: true;
                 primary: true;
                 clicked => {
                     root.confirm-open = false;

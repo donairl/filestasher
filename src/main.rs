@@ -226,6 +226,7 @@ impl App {
                     .map(|(e, sel)| FileEntry {
                         name: e.name.as_str().into(),
                         is_dir: e.is_dir,
+                        is_image: !e.is_dir && t.bucket.is_some() && is_image(&e.name),
                         size: if e.is_dir {
                             SharedString::new()
                         } else {
@@ -580,6 +581,19 @@ impl App {
                 row.selected = sel;
                 self.entries.set_row_data(i, row);
             }
+        }
+    }
+
+    /// Right click: keeps a multi-selection that contains the row, otherwise
+    /// selects just that row.
+    fn row_context(&self, index: usize) {
+        let already = self
+            .state
+            .borrow()
+            .active_tab()
+            .is_some_and(|t| t.selected.get(index) == Some(&true));
+        if !already {
+            self.row_clicked(index, false);
         }
     }
 
@@ -989,6 +1003,7 @@ fn main() -> Result<()> {
     ui.on_create_folder(|name| with_app(|a| a.create_folder(&name)));
     ui.on_row_clicked(|i, toggle| with_app(|a| a.row_clicked(i as usize, toggle)));
     ui.on_row_activated(|i| with_app(|a| a.row_activated(i as usize)));
+    ui.on_row_context(|i| with_app(|a| a.row_context(i as usize)));
     ui.on_confirm_accepted(|| with_app(|a| a.confirm_accepted()));
 
     ui.run()?;
