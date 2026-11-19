@@ -9,7 +9,11 @@ Cloudflare R2, Wasabi, and others), written in Rust with a
 - Saved server profiles: add, edit, delete, and test the connection before
   saving.
 - Several servers connected at once, each in its own tab.
-- Browse buckets and folders.
+- Browse buckets and folders. Large folders load 1000 entries at a time as you
+  scroll.
+- Sort by name, size or modified time by clicking a column title. The default
+  is newest first.
+- Search the current folder by name.
 - Upload files, with multipart upload for files larger than 32 MiB.
 - Download files and whole folders.
 - Image preview: double-click a PNG, JPEG, GIF, BMP, WebP or ICO file.

@@ -67,6 +67,44 @@ component Field inherits HorizontalLayout {
     }
 }
 
+// Clickable column title. The arrow shows the sort direction.
+component HeaderCell inherits Rectangle {
+    in property <string> title;
+    in property <bool> active;
+    in property <bool> descending;
+    in property <bool> align-right;
+    callback clicked();
+    background: ta.has-hover ? Palette.control-background : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    HorizontalLayout {
+        alignment: root.align-right ? end : start;
+        spacing: 4px;
+        Text {
+            text: root.title;
+            vertical-alignment: center;
+            font-weight: 600;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            Image {
+                source: @image-url("icons/up.svg");
+                colorize: Palette.foreground;
+                width: 12px;
+                height: 12px;
+                opacity: root.active ? 1 : 0;
+                transform-rotation: root.descending ? 180deg : 0deg;
+            }
+        }
+    }
+}
+
 component EntryIcon inherits Rectangle {
     in property <bool> is-dir;
     width: 16px;
@@ -111,6 +149,13 @@ export component MainWindow inherits Window {
     in property <bool> busy;
     in property <bool> in-bucket;
     in property <bool> has-more;
+    in-out property <string> search-text;
+    in property <string> search-info;
+    callback search-changed(string);
+    // 0 = name, 1 = size, 2 = modified
+    in property <int> sort-column: 2;
+    in property <bool> sort-descending: true;
+    callback sort-by(int);
     callback load-more();
     callback go-up();
     callback refresh();
@@ -355,11 +400,8 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                Text {
-                    text: root.location;
+                Rectangle {
                     horizontal-stretch: 1;
-                    vertical-alignment: center;
-                    overflow: elide;
                 }
 
                 Button {
@@ -404,6 +446,45 @@ export component MainWindow inherits Window {
                 }
             }
 
+            // Location and search
+            if root.active-tab >= 0: HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 6px;
+                padding-bottom: 6px;
+                spacing: 8px;
+                Text {
+                    text: root.location;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                Text {
+                    text: root.search-info;
+                    vertical-alignment: center;
+                    opacity: 0.7;
+                }
+
+                LineEdit {
+                    width: 220px;
+                    placeholder-text: "Search this folder";
+                    text <=> root.search-text;
+                    edited(text) => {
+                        root.search-changed(text);
+                    }
+                }
+
+                Button {
+                    icon: @image-url("icons/close.svg");
+                    colorize-icon: true;
+                    enabled: root.search-text != "";
+                    clicked => {
+                        root.search-text = "";
+                        root.search-changed("");
+                    }
+                }
+            }
+
             // Column header
             if root.active-tab >= 0: Rectangle {
                 height: 26px;
@@ -416,26 +497,35 @@ export component MainWindow inherits Window {
                         width: 16px;
                     }
 
-                    Text {
-                        text: "Name";
+                    HeaderCell {
+                        title: "Name";
                         horizontal-stretch: 1;
-                        vertical-alignment: center;
-                        font-weight: 600;
+                        active: root.sort-column == 0;
+                        descending: root.sort-descending;
+                        clicked => {
+                            root.sort-by(0);
+                        }
                     }
 
-                    Text {
-                        text: "Size";
+                    HeaderCell {
+                        title: "Size";
                         width: 90px;
-                        horizontal-alignment: right;
-                        vertical-alignment: center;
-                        font-weight: 600;
+                        align-right: true;
+                        active: root.sort-column == 1;
+                        descending: root.sort-descending;
+                        clicked => {
+                            root.sort-by(1);
+                        }
                     }
 
-                    Text {
-                        text: "Modified";
+                    HeaderCell {
+                        title: "Modified";
                         width: 140px;
-                        vertical-alignment: center;
-                        font-weight: 600;
+                        active: root.sort-column == 2;
+                        descending: root.sort-descending;
+                        clicked => {
+                            root.sort-by(2);
+                        }
                     }
                 }
             }

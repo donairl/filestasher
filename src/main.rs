@@ -41,6 +41,8 @@ struct Tab {
     busy: bool,
     /// Continuation token when the folder has more entries to load.
     next_token: Option<String>,
+    /// Search text; only entries whose name contains it are shown.
+    filter: String,
     /// Bumped on every load; results from older loads are dropped.
     generation: u64,
 }
@@ -51,6 +53,13 @@ impl Tab {
             None => "s3://".to_string(),
             Some(b) => format!("s3://{b}/{}", self.prefix),
         }
+    }
+
+    /// The search text as compared: trimmed and lower case. Empty means no
+    /// search. `filter` itself stays as typed, so the search box is not
+    /// rewritten under the cursor.
+    fn needle(&self) -> String {
+        self.filter.trim().to_lowercase()
     }
 
     fn selected_entries(&self) -> Vec<Entry> {
@@ -88,6 +97,64 @@ struct State {
     global_status: String,
     /// Bumped per preview; results of older previews are dropped.
     preview_generation: u64,
+    /// Order of every tab's listing.
+    sort: SortOrder,
+    /// For each row on screen, its index in the active tab's entries. Differs
+    /// from the identity while a search filter hides entries.
+    visible: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SortColumn {
+    Name,
+    Size,
+    Modified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SortOrder {
+    column: SortColumn,
+    descending: bool,
+}
+
+impl Default for SortOrder {
+    /// Newest first.
+    fn default() -> Self {
+        SortOrder {
+            column: SortColumn::Modified,
+            descending: true,
+        }
+    }
+}
+
+impl SortOrder {
+    /// Folders always come before files. Ties fall back to the name.
+    fn compare(self, a: &Entry, b: &Entry) -> std::cmp::Ordering {
+        let by_column = match self.column {
+            SortColumn::Name => a.name.cmp(&b.name),
+            SortColumn::Size => a.size.cmp(&b.size),
+            SortColumn::Modified => a.modified.cmp(&b.modified),
+        };
+        let by_column = if self.descending {
+            by_column.reverse()
+        } else {
+            by_column
+        };
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then(by_column)
+            .then_with(|| a.name.cmp(&b.name))
+    }
+
+    /// Sorts a listing, keeping each entry's selection flag with it.
+    fn apply(self, entries: &mut Vec<Entry>, selected: &mut Vec<bool>) {
+        let mut rows: Vec<(Entry, bool)> = std::mem::take(entries)
+            .into_iter()
+            .zip(std::mem::take(selected))
+            .collect();
+        rows.sort_by(|a, b| self.compare(&a.0, &b.0));
+        (*entries, *selected) = rows.into_iter().unzip();
+    }
 }
 
 /// Larger images are not downloaded for preview.
@@ -219,6 +286,12 @@ impl App {
         let titles: Vec<SharedString> = st.tabs.iter().map(|t| t.title.as_str().into()).collect();
         ui.set_tabs(ModelRc::new(VecModel::from(titles)));
         ui.set_active_tab(st.active.map_or(-1, |i| i as i32));
+        ui.set_sort_column(match st.sort.column {
+            SortColumn::Name => 0,
+            SortColumn::Size => 1,
+            SortColumn::Modified => 2,
+        });
+        ui.set_sort_descending(st.sort.descending);
         match st.active_tab() {
             Some(t) => {
                 ui.set_location(t.location().into());
@@ -226,6 +299,7 @@ impl App {
                 ui.set_busy(t.busy);
                 ui.set_in_bucket(t.bucket.is_some());
                 ui.set_has_more(t.next_token.is_some());
+                ui.set_search_text(t.filter.as_str().into());
             }
             None => {
                 ui.set_location(SharedString::new());
@@ -233,6 +307,7 @@ impl App {
                 ui.set_busy(false);
                 ui.set_in_bucket(false);
                 ui.set_has_more(false);
+                ui.set_search_text(SharedString::new());
             }
         }
     }
@@ -241,15 +316,69 @@ impl App {
     /// listing itself changed.
     fn sync_view(&self) {
         self.sync_status();
-        let st = self.state.borrow();
-        let rows = st.active_tab().map_or_else(Vec::new, |t| {
-            t.entries
-                .iter()
-                .zip(&t.selected)
-                .map(|(e, sel)| file_row(e, t.bucket.is_some(), *sel))
-                .collect()
-        });
+        let (rows, info) = {
+            let mut st = self.state.borrow_mut();
+            let mut visible = Vec::new();
+            let mut rows = Vec::new();
+            let mut info = String::new();
+            if let Some(t) = st.active_tab() {
+                let lowered = t.needle();
+                for (i, (e, sel)) in t.entries.iter().zip(&t.selected).enumerate() {
+                    if lowered.is_empty() || e.name.to_lowercase().contains(&lowered) {
+                        visible.push(i);
+                        rows.push(file_row(e, t.bucket.is_some(), *sel));
+                    }
+                }
+                if !lowered.is_empty() {
+                    info = format!("{} of {}", rows.len(), t.entries.len());
+                    if t.next_token.is_some() {
+                        info.push_str(", searching…");
+                    }
+                }
+            }
+            st.visible = visible;
+            (rows, info)
+        };
+        self.ui().set_search_info(info.into());
         self.entries.set_vec(rows);
+    }
+
+    /// Entry index behind a row on screen.
+    fn entry_index(&self, row: usize) -> Option<usize> {
+        self.state.borrow().visible.get(row).copied()
+    }
+
+    /// Search box edited. While a search is active the remaining pages are
+    /// loaded in the background, so the whole folder gets searched.
+    fn search_changed(&self, text: &str) {
+        {
+            let mut st = self.state.borrow_mut();
+            let Some(t) = st.active_tab_mut() else { return };
+            t.filter = text.to_string();
+            // Never keep a selection the user can no longer see.
+            let needle = t.needle();
+            if !needle.is_empty() {
+                for (e, sel) in t.entries.iter().zip(t.selected.iter_mut()) {
+                    if *sel && !e.name.to_lowercase().contains(&needle) {
+                        *sel = false;
+                    }
+                }
+            }
+        }
+        self.sync_view();
+        self.continue_search();
+    }
+
+    /// Loads the next page when the active tab has a search and more pages.
+    fn continue_search(&self) {
+        let searching = self
+            .state
+            .borrow()
+            .active_tab()
+            .is_some_and(|t| !t.needle().is_empty() && t.next_token.is_some());
+        if searching {
+            self.load_more();
+        }
     }
 
     fn sync_transfers(&self) {
@@ -440,6 +569,7 @@ impl App {
                 status: String::new(),
                 busy: false,
                 next_token: None,
+                filter: String::new(),
                 generation: 0,
             });
             st.active = Some(st.tabs.len() - 1);
@@ -459,6 +589,7 @@ impl App {
             st.active = Some(index);
         }
         self.sync_view();
+        self.continue_search();
     }
 
     fn close_tab(&self, index: usize) {
@@ -510,6 +641,7 @@ impl App {
     fn loaded(&self, tab_id: u64, generation: u64, result: Result<Page>) {
         {
             let mut st = self.state.borrow_mut();
+            let sort = st.sort;
             let Some(t) = st.tab_mut(tab_id) else { return };
             if t.generation != generation {
                 return;
@@ -519,6 +651,7 @@ impl App {
                 Ok(page) => {
                     t.selected = vec![false; page.entries.len()];
                     t.entries = page.entries;
+                    sort.apply(&mut t.entries, &mut t.selected);
                     t.next_token = page.next;
                     t.status = count_status(t.entries.len(), t.next_token.is_some());
                 }
@@ -531,6 +664,7 @@ impl App {
             }
         }
         self.sync_view();
+        self.continue_search();
     }
 
     /// Loads the next page of the active tab, if there is one. Called when
@@ -565,9 +699,9 @@ impl App {
     }
 
     fn loaded_more(&self, tab_id: u64, generation: u64, result: Result<Page>) {
-        let new_rows = {
+        let changed = {
             let mut st = self.state.borrow_mut();
-            let is_active = st.active_tab().is_some_and(|t| t.id == tab_id);
+            let sort = st.sort;
             let Some(t) = st.tab_mut(tab_id) else { return };
             // The tab navigated or reloaded while the page was loading.
             if t.generation != generation {
@@ -576,29 +710,52 @@ impl App {
             t.busy = false;
             match result {
                 Ok(page) => {
-                    let rows: Vec<FileEntry> = page
-                        .entries
-                        .iter()
-                        .map(|e| file_row(e, true, false))
-                        .collect();
-                    t.selected.extend(std::iter::repeat_n(false, page.entries.len()));
+                    t.selected
+                        .extend(std::iter::repeat_n(false, page.entries.len()));
                     t.entries.extend(page.entries);
+                    // New entries belong anywhere in the sorted order.
+                    sort.apply(&mut t.entries, &mut t.selected);
                     t.next_token = page.next;
                     t.status = count_status(t.entries.len(), t.next_token.is_some());
-                    is_active.then_some(rows)
+                    true
                 }
                 Err(e) => {
                     // Keep the token so scrolling again retries.
                     t.status = format!("Error loading more: {e:#}");
-                    None
+                    false
                 }
             }
         };
-        // Appends instead of replacing the model, so the scroll position stays.
-        if let Some(rows) = new_rows {
-            self.entries.extend(rows);
+        if changed {
+            self.sync_view();
+            self.continue_search();
+        } else {
+            self.sync_status();
         }
-        self.sync_status();
+    }
+
+    /// Header click: a new column starts in its natural direction, the
+    /// current column flips.
+    fn sort_by(&self, column: SortColumn) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.sort = if st.sort.column == column {
+                SortOrder {
+                    column,
+                    descending: !st.sort.descending,
+                }
+            } else {
+                SortOrder {
+                    column,
+                    descending: column != SortColumn::Name,
+                }
+            };
+            let sort = st.sort;
+            for t in &mut st.tabs {
+                sort.apply(&mut t.entries, &mut t.selected);
+            }
+        }
+        self.sync_view();
     }
 
     /// Reloads a tab only if it is still showing `bucket`/`prefix`.
@@ -631,14 +788,19 @@ impl App {
             } else {
                 return;
             }
+            t.filter.clear();
             t.id
         };
         self.load(id);
     }
 
-    fn row_clicked(&self, index: usize, toggle: bool) {
-        let selected = {
+    fn row_clicked(&self, row: usize, toggle: bool) {
+        let Some(index) = self.entry_index(row) else {
+            return;
+        };
+        let shown: Vec<bool> = {
             let mut st = self.state.borrow_mut();
+            let visible = st.visible.clone();
             let Some(t) = st.active_tab_mut() else { return };
             if index >= t.selected.len() {
                 return;
@@ -650,9 +812,9 @@ impl App {
                     *sel = i == index;
                 }
             }
-            t.selected.clone()
+            visible.iter().map(|&i| t.selected[i]).collect()
         };
-        for (i, sel) in selected.into_iter().enumerate() {
+        for (i, sel) in shown.into_iter().enumerate() {
             if let Some(mut row) = self.entries.row_data(i)
                 && row.selected != sel
             {
@@ -664,14 +826,17 @@ impl App {
 
     /// Right click: keeps a multi-selection that contains the row, otherwise
     /// selects just that row.
-    fn row_context(&self, index: usize) {
+    fn row_context(&self, row: usize) {
+        let Some(index) = self.entry_index(row) else {
+            return;
+        };
         let already = self
             .state
             .borrow()
             .active_tab()
             .is_some_and(|t| t.selected.get(index) == Some(&true));
         if !already {
-            self.row_clicked(index, false);
+            self.row_clicked(row, false);
         }
     }
 
@@ -717,7 +882,10 @@ impl App {
         });
     }
 
-    fn row_activated(&self, index: usize) {
+    fn row_activated(&self, row: usize) {
+        let Some(index) = self.entry_index(row) else {
+            return;
+        };
         let id = {
             let mut st = self.state.borrow_mut();
             let Some(t) = st.active_tab_mut() else { return };
@@ -743,6 +911,7 @@ impl App {
             } else {
                 t.prefix = entry.key.clone();
             }
+            t.filter.clear();
             t.id
         };
         self.load(id);
@@ -1099,6 +1268,15 @@ fn main() -> Result<()> {
     ui.on_go_up(|| with_app(|a| a.go_up()));
     ui.on_refresh(|| with_app(|a| a.refresh()));
     ui.on_load_more(|| with_app(|a| a.load_more()));
+    ui.on_search_changed(|text| with_app(|a| a.search_changed(&text)));
+    ui.on_sort_by(|column| {
+        let column = match column {
+            0 => SortColumn::Name,
+            1 => SortColumn::Size,
+            _ => SortColumn::Modified,
+        };
+        with_app(|a| a.sort_by(column));
+    });
     ui.on_upload(|| with_app(|a| a.upload()));
     ui.on_download(|| with_app(|a| a.download()));
     ui.on_delete_selected(|| with_app(|a| a.ask_delete_selected()));
@@ -1111,4 +1289,63 @@ fn main() -> Result<()> {
     ui.run()?;
     APP.with(|a| a.borrow_mut().take());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool, size: u64, modified: Option<i64>) -> Entry {
+        Entry {
+            name: name.into(),
+            key: name.into(),
+            is_dir,
+            size,
+            modified,
+        }
+    }
+
+    fn sorted(column: SortColumn, descending: bool) -> (Vec<String>, Vec<bool>) {
+        let mut entries = vec![
+            entry("b.txt", false, 30, Some(100)),
+            entry("zdir", true, 0, None),
+            entry("a.txt", false, 10, Some(300)),
+            entry("c.txt", false, 20, Some(200)),
+            entry("adir", true, 0, None),
+        ];
+        // Only "a.txt" is selected.
+        let mut selected = vec![false, false, true, false, false];
+        SortOrder { column, descending }.apply(&mut entries, &mut selected);
+        (entries.into_iter().map(|e| e.name).collect(), selected)
+    }
+
+    #[test]
+    fn default_is_newest_first() {
+        let order = SortOrder::default();
+        let (names, selected) = sorted(order.column, order.descending);
+        assert_eq!(names, ["adir", "zdir", "a.txt", "c.txt", "b.txt"]);
+        // The selection flag moved with its entry.
+        assert_eq!(selected, [false, false, true, false, false]);
+    }
+
+    #[test]
+    fn sort_columns() {
+        let names = |c, d| sorted(c, d).0;
+        assert_eq!(
+            names(SortColumn::Modified, false),
+            ["adir", "zdir", "b.txt", "c.txt", "a.txt"]
+        );
+        assert_eq!(
+            names(SortColumn::Name, false),
+            ["adir", "zdir", "a.txt", "b.txt", "c.txt"]
+        );
+        assert_eq!(
+            names(SortColumn::Name, true),
+            ["zdir", "adir", "c.txt", "b.txt", "a.txt"]
+        );
+        assert_eq!(
+            names(SortColumn::Size, true),
+            ["adir", "zdir", "b.txt", "c.txt", "a.txt"]
+        );
+    }
 }
