@@ -1,0 +1,625 @@
+import { Button, LineEdit, CheckBox, ListView, ProgressIndicator, Spinner, Palette } from "std-widgets.slint";
+
+export struct ServerItem {
+    name: string,
+    endpoint: string,
+}
+
+export struct FileEntry {
+    name: string,
+    is-dir: bool,
+    size: string,
+    modified: string,
+    selected: bool,
+}
+
+component Modal inherits Rectangle {
+    in property <string> title;
+    in property <length> box-width: 440px;
+    background: #000000a0;
+
+    // Swallows clicks so the window behind is inert.
+    TouchArea { }
+
+    VerticalLayout {
+        alignment: center;
+        HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: root.box-width;
+                background: Palette.background;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: Palette.border;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+                    Text {
+                        text: root.title;
+                        font-size: 16px;
+                        font-weight: 600;
+                    }
+
+                    @children
+                }
+            }
+        }
+    }
+}
+
+component Field inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> hint;
+    in property <bool> secret;
+    in-out property <string> value;
+    spacing: 8px;
+    Text {
+        text: root.label;
+        width: 110px;
+        vertical-alignment: center;
+    }
+
+    LineEdit {
+        text <=> root.value;
+        placeholder-text: root.hint;
+        input-type: root.secret ? InputType.password : InputType.text;
+    }
+}
+
+component EntryIcon inherits Rectangle {
+    in property <bool> is-dir;
+    width: 16px;
+    height: 16px;
+    Rectangle {
+        width: root.is-dir ? 16px : 12px;
+        height: root.is-dir ? 12px : 16px;
+        border-radius: 2px;
+        background: root.is-dir ? #e0a030 : transparent;
+        border-width: root.is-dir ? 0px : 1.5px;
+        border-color: Palette.foreground;
+        opacity: root.is-dir ? 1 : 0.6;
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "S3 FStasher";
+    preferred-width: 1040px;
+    preferred-height: 660px;
+    min-width: 760px;
+    min-height: 440px;
+
+    // Servers
+    in property <[ServerItem]> servers;
+    in-out property <int> selected-server: -1;
+    callback connect-server(int);
+    callback add-server();
+    callback edit-server(int);
+    callback delete-server(int);
+
+    // Tabs
+    in property <[string]> tabs;
+    in property <int> active-tab: -1;
+    callback select-tab(int);
+    callback close-tab(int);
+
+    // Active tab view
+    in property <string> location;
+    in property <[FileEntry]> entries;
+    in property <string> status;
+    in property <bool> busy;
+    in property <bool> in-bucket;
+    callback go-up();
+    callback refresh();
+    callback upload();
+    callback download();
+    callback delete-selected();
+    callback create-folder(string);
+    callback row-clicked(int, bool);
+    callback row-activated(int);
+
+    // Transfers
+    in property <int> transfer-count;
+    in property <float> transfer-progress;
+    in property <string> transfer-text;
+
+    // Server dialog
+    in-out property <bool> server-dialog-open;
+    in property <string> server-dialog-title;
+    in-out property <string> form-name;
+    in-out property <string> form-endpoint;
+    in-out property <string> form-region;
+    in-out property <string> form-access-key;
+    in-out property <string> form-secret-key;
+    in-out property <string> form-bucket;
+    in-out property <bool> form-path-style;
+    in property <string> form-message;
+    callback save-server();
+    callback test-server();
+
+    // Confirm dialog
+    in-out property <bool> confirm-open;
+    in property <string> confirm-text;
+    callback confirm-accepted();
+
+    // New folder dialog
+    in-out property <bool> newfolder-open;
+    in-out property <string> newfolder-name;
+
+    HorizontalLayout {
+        // Sidebar
+        Rectangle {
+            width: 230px;
+            background: Palette.alternate-background;
+            VerticalLayout {
+                padding: 8px;
+                spacing: 6px;
+                Text {
+                    text: "Servers";
+                    font-weight: 700;
+                }
+
+                ListView {
+                    vertical-stretch: 1;
+                    for s[i] in root.servers: Rectangle {
+                        height: 44px;
+                        border-radius: 4px;
+                        background: i == root.selected-server ? Palette.selection-background : sta.has-hover ? Palette.control-background : transparent;
+                        sta := TouchArea {
+                            clicked => {
+                                root.selected-server = i;
+                            }
+                            double-clicked => {
+                                root.selected-server = i;
+                                root.connect-server(i);
+                            }
+                        }
+
+                        VerticalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            alignment: center;
+                            Text {
+                                text: s.name;
+                                overflow: elide;
+                                color: i == root.selected-server ? Palette.selection-foreground : Palette.foreground;
+                            }
+
+                            Text {
+                                text: s.endpoint;
+                                font-size: 11px;
+                                overflow: elide;
+                                opacity: 0.7;
+                                color: i == root.selected-server ? Palette.selection-foreground : Palette.foreground;
+                            }
+                        }
+                    }
+                }
+
+                Button {
+                    text: "Connect";
+                    primary: true;
+                    enabled: root.selected-server >= 0;
+                    clicked => {
+                        root.connect-server(root.selected-server);
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 4px;
+                    Button {
+                        text: "Add";
+                        clicked => {
+                            root.add-server();
+                        }
+                    }
+
+                    Button {
+                        text: "Edit";
+                        enabled: root.selected-server >= 0;
+                        clicked => {
+                            root.edit-server(root.selected-server);
+                        }
+                    }
+
+                    Button {
+                        text: "Delete";
+                        enabled: root.selected-server >= 0;
+                        clicked => {
+                            root.delete-server(root.selected-server);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Main area
+        VerticalLayout {
+            horizontal-stretch: 1;
+
+            if root.active-tab < 0: Text {
+                text: "Double-click a server to connect.\nEach connection opens in its own tab.";
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                vertical-stretch: 1;
+                opacity: 0.6;
+            }
+
+            // Tab bar
+            if root.active-tab >= 0: Rectangle {
+                height: 34px;
+                background: Palette.alternate-background;
+                HorizontalLayout {
+                    alignment: start;
+                    for t[i] in root.tabs: Rectangle {
+                        background: i == root.active-tab ? Palette.background : tta.has-hover ? Palette.control-background : transparent;
+                        tta := TouchArea {
+                            clicked => {
+                                root.select-tab(i);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 6px;
+                            spacing: 6px;
+                            Text {
+                                text: t;
+                                vertical-alignment: center;
+                                max-width: 170px;
+                                overflow: elide;
+                                font-weight: i == root.active-tab ? 600 : 400;
+                            }
+
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 18px;
+                                    height: 18px;
+                                    border-radius: 9px;
+                                    background: cta.has-hover ? #88888866 : transparent;
+                                    Text {
+                                        text: "×";
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    cta := TouchArea {
+                                        clicked => {
+                                            root.close-tab(i);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Toolbar
+            if root.active-tab >= 0: HorizontalLayout {
+                padding: 6px;
+                spacing: 6px;
+                Button {
+                    text: "Up";
+                    enabled: root.in-bucket;
+                    clicked => {
+                        root.go-up();
+                    }
+                }
+
+                Button {
+                    text: "Refresh";
+                    clicked => {
+                        root.refresh();
+                    }
+                }
+
+                Text {
+                    text: root.location;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                Button {
+                    text: "Upload";
+                    enabled: root.in-bucket;
+                    clicked => {
+                        root.upload();
+                    }
+                }
+
+                Button {
+                    text: "Download";
+                    enabled: root.in-bucket;
+                    clicked => {
+                        root.download();
+                    }
+                }
+
+                Button {
+                    text: "New Folder";
+                    enabled: root.in-bucket;
+                    clicked => {
+                        root.newfolder-name = "";
+                        root.newfolder-open = true;
+                    }
+                }
+
+                Button {
+                    text: "Delete";
+                    enabled: root.in-bucket;
+                    clicked => {
+                        root.delete-selected();
+                    }
+                }
+            }
+
+            // Column header
+            if root.active-tab >= 0: Rectangle {
+                height: 26px;
+                background: Palette.alternate-background;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 24px;
+                    spacing: 8px;
+                    Rectangle {
+                        width: 16px;
+                    }
+
+                    Text {
+                        text: "Name";
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        text: "Size";
+                        width: 90px;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        text: "Modified";
+                        width: 140px;
+                        vertical-alignment: center;
+                        font-weight: 600;
+                    }
+                }
+            }
+
+            if root.active-tab >= 0: ListView {
+                vertical-stretch: 1;
+                for entry[i] in root.entries: Rectangle {
+                    height: 28px;
+                    background: entry.selected ? Palette.selection-background : rta.has-hover ? Palette.alternate-background : transparent;
+                    rta := TouchArea {
+                        pointer-event(ev) => {
+                            if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                                root.row-clicked(i, ev.modifiers.control);
+                            }
+                        }
+                        double-clicked => {
+                            root.row-activated(i);
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            EntryIcon {
+                                is-dir: entry.is-dir;
+                            }
+                        }
+
+                        Text {
+                            text: entry.name;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            color: entry.selected ? Palette.selection-foreground : Palette.foreground;
+                        }
+
+                        Text {
+                            text: entry.size;
+                            width: 90px;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                            color: entry.selected ? Palette.selection-foreground : Palette.foreground;
+                        }
+
+                        Text {
+                            text: entry.modified;
+                            width: 140px;
+                            vertical-alignment: center;
+                            color: entry.selected ? Palette.selection-foreground : Palette.foreground;
+                        }
+                    }
+                }
+            }
+
+            // Status bar
+            Rectangle {
+                height: 28px;
+                background: Palette.alternate-background;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 8px;
+                    if root.busy: VerticalLayout {
+                        alignment: center;
+                        Spinner {
+                            width: 16px;
+                            height: 16px;
+                            indeterminate: true;
+                        }
+                    }
+                    Text {
+                        text: root.status;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    if root.transfer-count > 0: Text {
+                        text: root.transfer-text;
+                        vertical-alignment: center;
+                    }
+                    if root.transfer-count > 0: VerticalLayout {
+                        alignment: center;
+                        ProgressIndicator {
+                            width: 140px;
+                            progress: root.transfer-progress;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.server-dialog-open: Modal {
+        title: root.server-dialog-title;
+        box-width: 480px;
+        Field {
+            label: "Name";
+            value <=> root.form-name;
+        }
+
+        Field {
+            label: "Endpoint URL";
+            hint: "https://… (blank for AWS)";
+            value <=> root.form-endpoint;
+        }
+
+        Field {
+            label: "Region";
+            hint: "us-east-1";
+            value <=> root.form-region;
+        }
+
+        Field {
+            label: "Access key";
+            value <=> root.form-access-key;
+        }
+
+        Field {
+            label: "Secret key";
+            secret: true;
+            value <=> root.form-secret-key;
+        }
+
+        Field {
+            label: "Default bucket";
+            hint: "optional";
+            value <=> root.form-bucket;
+        }
+
+        CheckBox {
+            text: "Path-style addressing (MinIO, Ceph)";
+            checked <=> root.form-path-style;
+        }
+
+        Text {
+            text: root.form-message;
+            wrap: word-wrap;
+            min-height: 32px;
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            Button {
+                text: "Test Connection";
+                clicked => {
+                    root.test-server();
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            Button {
+                text: "Cancel";
+                clicked => {
+                    root.server-dialog-open = false;
+                }
+            }
+
+            Button {
+                text: "Save";
+                primary: true;
+                clicked => {
+                    root.save-server();
+                }
+            }
+        }
+    }
+
+    if root.newfolder-open: Modal {
+        title: "New folder";
+        box-width: 380px;
+        LineEdit {
+            text <=> root.newfolder-name;
+            placeholder-text: "Folder name";
+            accepted => {
+                root.newfolder-open = false;
+                root.create-folder(root.newfolder-name);
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+            Button {
+                text: "Cancel";
+                clicked => {
+                    root.newfolder-open = false;
+                }
+            }
+
+            Button {
+                text: "Create";
+                primary: true;
+                clicked => {
+                    root.newfolder-open = false;
+                    root.create-folder(root.newfolder-name);
+                }
+            }
+        }
+    }
+
+    if root.confirm-open: Modal {
+        title: "Confirm delete";
+        box-width: 420px;
+        Text {
+            text: root.confirm-text;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+            Button {
+                text: "Cancel";
+                clicked => {
+                    root.confirm-open = false;
+                }
+            }
+
+            Button {
+                text: "Delete";
+                primary: true;
+                clicked => {
+                    root.confirm-open = false;
+                    root.confirm-accepted();
+                }
+            }
+        }
+    }
+}
