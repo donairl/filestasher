@@ -198,6 +198,7 @@ export component MainWindow inherits Window {
     in property <string> status;
     in property <bool> busy;
     in property <bool> in-bucket;
+    in property <bool> can-go-up;
     in property <bool> has-more;
     in-out property <bool> search-open;
     in-out property <string> search-text;
@@ -535,7 +536,7 @@ export component MainWindow inherits Window {
                 IconButton {
                     icon: @image-url("icons/up.svg");
                     tooltip: "Up";
-                    enabled: root.in-bucket;
+                    enabled: root.can-go-up;
                     clicked => {
                         root.go-up();
                     }

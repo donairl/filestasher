@@ -45,6 +45,9 @@ struct Tab {
     filter: String,
     /// True until the first listing after connect arrives.
     connecting: bool,
+    /// The tab is confined to its bucket: the profile names a default bucket,
+    /// so the bucket list is not part of this tab.
+    pinned_bucket: bool,
     /// Bumped on every load; results from older loads are dropped.
     generation: u64,
 }
@@ -62,6 +65,11 @@ impl Tab {
     /// rewritten under the cursor.
     fn needle(&self) -> String {
         self.filter.trim().to_lowercase()
+    }
+
+    /// Whether there is a level above the current location.
+    fn can_go_up(&self) -> bool {
+        !self.prefix.is_empty() || (self.bucket.is_some() && !self.pinned_bucket)
     }
 
     fn selected_entries(&self) -> Vec<Entry> {
@@ -476,6 +484,7 @@ impl App {
                 ui.set_status(t.status.as_str().into());
                 ui.set_busy(t.busy);
                 ui.set_in_bucket(t.bucket.is_some());
+                ui.set_can_go_up(t.can_go_up());
                 ui.set_has_more(t.next_token.is_some());
                 ui.set_search_text(t.filter.as_str().into());
                 // An active search is always visible. An empty box stays as
@@ -489,6 +498,7 @@ impl App {
                 ui.set_status(st.global_status.as_str().into());
                 ui.set_busy(false);
                 ui.set_in_bucket(false);
+                ui.set_can_go_up(false);
                 ui.set_has_more(false);
                 ui.set_search_text(SharedString::new());
                 ui.set_search_open(false);
@@ -766,6 +776,7 @@ impl App {
                 next_token: None,
                 filter: String::new(),
                 connecting: true,
+                pinned_bucket: !profile.bucket.is_empty(),
                 generation: 0,
             });
             st.active = Some(st.tabs.len() - 1);
@@ -980,12 +991,13 @@ impl App {
         let id = {
             let mut st = self.state.borrow_mut();
             let Some(t) = st.active_tab_mut() else { return };
+            if !t.can_go_up() {
+                return;
+            }
             if !t.prefix.is_empty() {
                 t.prefix = parent_prefix(&t.prefix);
-            } else if t.bucket.is_some() {
-                t.bucket = None;
             } else {
-                return;
+                t.bucket = None;
             }
             t.filter.clear();
             t.id
