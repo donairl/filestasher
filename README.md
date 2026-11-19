@@ -109,6 +109,21 @@ bucket = ""
 S3 calls run on a tokio runtime, and results are applied on the UI thread, so
 the window stays responsive during transfers.
 
+## Releasing
+
+Pushing a tag that starts with `v` runs `.github/workflows/release.yml`. It
+builds the Linux and Windows binaries and attaches them to a GitHub release
+for that tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release gets `s3-fstasher-<tag>-linux-x86_64.tar.gz` and
+`s3-fstasher-<tag>-windows-x86_64.zip`. Keep the tag in step with `version` in
+`Cargo.toml`.
+
 ## Tests
 
 ```sh
