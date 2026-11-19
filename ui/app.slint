@@ -110,6 +110,8 @@ export component MainWindow inherits Window {
     in property <string> status;
     in property <bool> busy;
     in property <bool> in-bucket;
+    in property <bool> has-more;
+    callback load-more();
     callback go-up();
     callback refresh();
     callback upload();
@@ -440,6 +442,12 @@ export component MainWindow inherits Window {
 
             if root.active-tab >= 0: ListView {
                 vertical-stretch: 1;
+                // Lazy loading: ask for the next page near the end of the list.
+                changed content-y => {
+                    if (root.has-more && !root.busy && self.visible-height - self.content-y >= self.content-height - 600px) {
+                        root.load-more();
+                    }
+                }
                 for entry[i] in root.entries: Rectangle {
                     height: 28px;
                     background: entry.selected ? Palette.selection-background : rta.has-hover ? Palette.alternate-background : transparent;

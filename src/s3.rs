@@ -19,6 +19,8 @@ use crate::config::ServerProfile;
 const MULTIPART_THRESHOLD: u64 = 32 * 1024 * 1024;
 const MIN_PART_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_PARTS: u64 = 10_000;
+/// Entries fetched per listing request.
+const PAGE_SIZE: i32 = 1000;
 
 /// Called with the number of bytes just transferred.
 pub type Progress<'a> = &'a (dyn Fn(u64) + Send + Sync);
@@ -118,49 +120,67 @@ pub async fn list_buckets(client: &Client) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
-/// One folder level: sub-folders first, then objects.
-pub async fn list_dir(client: &Client, bucket: &str, prefix: &str) -> Result<Vec<Entry>> {
-    let mut out = Vec::new();
-    let mut pages = client
+/// One page of a folder listing.
+pub struct Page {
+    pub entries: Vec<Entry>,
+    /// Token for the next page, `None` on the last one.
+    pub next: Option<String>,
+}
+
+/// Lists one page of a folder level, at most [`PAGE_SIZE`] entries. Within the
+/// page sub-folders come first, then objects. Pass the previous page's `next`
+/// as `token` to continue.
+pub async fn list_page(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    token: Option<String>,
+) -> Result<Page> {
+    let resp = client
         .list_objects_v2()
         .bucket(bucket)
         .prefix(prefix)
         .delimiter("/")
-        .into_paginator()
-        .send();
-    while let Some(page) = pages.next().await {
-        let page = page.map_err(|e| sdk_err("list objects", e))?;
-        for cp in page.common_prefixes() {
-            let Some(p) = cp.prefix() else { continue };
-            let name = p.strip_prefix(prefix).unwrap_or(p).trim_end_matches('/');
-            if name.is_empty() {
-                continue;
-            }
-            out.push(Entry {
-                name: name.to_string(),
-                key: p.to_string(),
-                is_dir: true,
-                size: 0,
-                modified: None,
-            });
+        .max_keys(PAGE_SIZE)
+        .set_continuation_token(token)
+        .send()
+        .await
+        .map_err(|e| sdk_err("list objects", e))?;
+    let mut out = Vec::new();
+    for cp in resp.common_prefixes() {
+        let Some(p) = cp.prefix() else { continue };
+        let name = p.strip_prefix(prefix).unwrap_or(p).trim_end_matches('/');
+        if name.is_empty() {
+            continue;
         }
-        for obj in page.contents() {
-            let Some(key) = obj.key() else { continue };
-            // The folder's own marker object.
-            if key == prefix {
-                continue;
-            }
-            out.push(Entry {
-                name: key.strip_prefix(prefix).unwrap_or(key).to_string(),
-                key: key.to_string(),
-                is_dir: false,
-                size: obj.size().unwrap_or(0).max(0) as u64,
-                modified: obj.last_modified().map(|d| d.secs()),
-            });
+        out.push(Entry {
+            name: name.to_string(),
+            key: p.to_string(),
+            is_dir: true,
+            size: 0,
+            modified: None,
+        });
+    }
+    for obj in resp.contents() {
+        let Some(key) = obj.key() else { continue };
+        // The folder's own marker object.
+        if key == prefix {
+            continue;
         }
+        out.push(Entry {
+            name: key.strip_prefix(prefix).unwrap_or(key).to_string(),
+            key: key.to_string(),
+            is_dir: false,
+            size: obj.size().unwrap_or(0).max(0) as u64,
+            modified: obj.last_modified().map(|d| d.secs()),
+        });
     }
     out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
-    Ok(out)
+    let next = match resp.is_truncated() {
+        Some(true) => resp.next_continuation_token().map(str::to_string),
+        _ => None,
+    };
+    Ok(Page { entries: out, next })
 }
 
 /// Every object under `prefix`, as (key, size).

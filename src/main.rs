@@ -3,6 +3,9 @@
 //! All state lives on the UI thread in [`App`]. S3 work runs on a tokio
 //! runtime and reports back through [`on_ui`].
 
+// Release builds on Windows must not open a console window next to the app.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod config;
 mod s3;
 mod util;
@@ -20,7 +23,7 @@ use aws_sdk_s3::Client;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use config::{Config, ServerProfile};
-use s3::Entry;
+use s3::{Entry, Page};
 use util::{format_size, format_time, is_image, parent_prefix, safe_join};
 
 slint::include_modules!();
@@ -36,6 +39,8 @@ struct Tab {
     selected: Vec<bool>,
     status: String,
     busy: bool,
+    /// Continuation token when the folder has more entries to load.
+    next_token: Option<String>,
     /// Bumped on every load; results from older loads are dropped.
     generation: u64,
 }
@@ -207,7 +212,8 @@ impl App {
         ui.set_servers(ModelRc::new(VecModel::from(items)));
     }
 
-    fn sync_view(&self) {
+    /// Everything about the active tab except its rows.
+    fn sync_status(&self) {
         let st = self.state.borrow();
         let ui = self.ui();
         let titles: Vec<SharedString> = st.tabs.iter().map(|t| t.title.as_str().into()).collect();
@@ -219,33 +225,31 @@ impl App {
                 ui.set_status(t.status.as_str().into());
                 ui.set_busy(t.busy);
                 ui.set_in_bucket(t.bucket.is_some());
-                let rows: Vec<FileEntry> = t
-                    .entries
-                    .iter()
-                    .zip(&t.selected)
-                    .map(|(e, sel)| FileEntry {
-                        name: e.name.as_str().into(),
-                        is_dir: e.is_dir,
-                        is_image: !e.is_dir && t.bucket.is_some() && is_image(&e.name),
-                        size: if e.is_dir {
-                            SharedString::new()
-                        } else {
-                            format_size(e.size).into()
-                        },
-                        modified: e.modified.map(format_time).unwrap_or_default().into(),
-                        selected: *sel,
-                    })
-                    .collect();
-                self.entries.set_vec(rows);
+                ui.set_has_more(t.next_token.is_some());
             }
             None => {
                 ui.set_location(SharedString::new());
                 ui.set_status(st.global_status.as_str().into());
                 ui.set_busy(false);
                 ui.set_in_bucket(false);
-                self.entries.set_vec(Vec::new());
+                ui.set_has_more(false);
             }
         }
+    }
+
+    /// Status and rows. Replaces the row model, so use it only when the
+    /// listing itself changed.
+    fn sync_view(&self) {
+        self.sync_status();
+        let st = self.state.borrow();
+        let rows = st.active_tab().map_or_else(Vec::new, |t| {
+            t.entries
+                .iter()
+                .zip(&t.selected)
+                .map(|(e, sel)| file_row(e, t.bucket.is_some(), *sel))
+                .collect()
+        });
+        self.entries.set_vec(rows);
     }
 
     fn sync_transfers(&self) {
@@ -275,7 +279,7 @@ impl App {
         if let Some(t) = self.state.borrow_mut().tab_mut(tab_id) {
             t.status = msg;
         }
-        self.sync_view();
+        self.sync_status();
     }
 
     /// Status for the active tab, or the window when no tab is open.
@@ -287,7 +291,7 @@ impl App {
                 None => st.global_status = msg,
             }
         }
-        self.sync_view();
+        self.sync_status();
     }
 
     // ---- Servers ---------------------------------------------------------
@@ -435,6 +439,7 @@ impl App {
                 selected: Vec::new(),
                 status: String::new(),
                 busy: false,
+                next_token: None,
                 generation: 0,
             });
             st.active = Some(st.tabs.len() - 1);
@@ -492,14 +497,17 @@ impl App {
         self.sync_view();
         self.rt.spawn(async move {
             let result = match &bucket {
-                None => s3::list_buckets(&client).await,
-                Some(b) => s3::list_dir(&client, b, &prefix).await,
+                None => s3::list_buckets(&client).await.map(|entries| Page {
+                    entries,
+                    next: None,
+                }),
+                Some(b) => s3::list_page(&client, b, &prefix, None).await,
             };
             on_ui(move |app| app.loaded(tab_id, generation, result));
         });
     }
 
-    fn loaded(&self, tab_id: u64, generation: u64, result: Result<Vec<Entry>>) {
+    fn loaded(&self, tab_id: u64, generation: u64, result: Result<Page>) {
         {
             let mut st = self.state.borrow_mut();
             let Some(t) = st.tab_mut(tab_id) else { return };
@@ -508,19 +516,89 @@ impl App {
             }
             t.busy = false;
             match result {
-                Ok(entries) => {
-                    t.status = format!("{} item(s)", entries.len());
-                    t.selected = vec![false; entries.len()];
-                    t.entries = entries;
+                Ok(page) => {
+                    t.selected = vec![false; page.entries.len()];
+                    t.entries = page.entries;
+                    t.next_token = page.next;
+                    t.status = count_status(t.entries.len(), t.next_token.is_some());
                 }
                 Err(e) => {
                     t.status = format!("Error: {e:#}");
                     t.entries.clear();
                     t.selected.clear();
+                    t.next_token = None;
                 }
             }
         }
         self.sync_view();
+    }
+
+    /// Loads the next page of the active tab, if there is one. Called when
+    /// the list is scrolled near its end.
+    fn load_more(&self) {
+        let (tab_id, client, bucket, prefix, token, generation) = {
+            let mut st = self.state.borrow_mut();
+            let Some(t) = st.active_tab_mut() else { return };
+            // `busy` also covers a page that is already on its way.
+            if t.busy {
+                return;
+            }
+            let (Some(bucket), Some(token)) = (t.bucket.clone(), t.next_token.clone()) else {
+                return;
+            };
+            t.busy = true;
+            t.status = format!("{} item(s) loaded, loading more…", t.entries.len());
+            (
+                t.id,
+                t.client.clone(),
+                bucket,
+                t.prefix.clone(),
+                token,
+                t.generation,
+            )
+        };
+        self.sync_status();
+        self.rt.spawn(async move {
+            let result = s3::list_page(&client, &bucket, &prefix, Some(token)).await;
+            on_ui(move |app| app.loaded_more(tab_id, generation, result));
+        });
+    }
+
+    fn loaded_more(&self, tab_id: u64, generation: u64, result: Result<Page>) {
+        let new_rows = {
+            let mut st = self.state.borrow_mut();
+            let is_active = st.active_tab().is_some_and(|t| t.id == tab_id);
+            let Some(t) = st.tab_mut(tab_id) else { return };
+            // The tab navigated or reloaded while the page was loading.
+            if t.generation != generation {
+                return;
+            }
+            t.busy = false;
+            match result {
+                Ok(page) => {
+                    let rows: Vec<FileEntry> = page
+                        .entries
+                        .iter()
+                        .map(|e| file_row(e, true, false))
+                        .collect();
+                    t.selected.extend(std::iter::repeat_n(false, page.entries.len()));
+                    t.entries.extend(page.entries);
+                    t.next_token = page.next;
+                    t.status = count_status(t.entries.len(), t.next_token.is_some());
+                    is_active.then_some(rows)
+                }
+                Err(e) => {
+                    // Keep the token so scrolling again retries.
+                    t.status = format!("Error loading more: {e:#}");
+                    None
+                }
+            }
+        };
+        // Appends instead of replacing the model, so the scroll position stays.
+        if let Some(rows) = new_rows {
+            self.entries.extend(rows);
+        }
+        self.sync_status();
     }
 
     /// Reloads a tab only if it is still showing `bucket`/`prefix`.
@@ -850,6 +928,29 @@ impl App {
     }
 }
 
+fn file_row(e: &Entry, in_bucket: bool, selected: bool) -> FileEntry {
+    FileEntry {
+        name: e.name.as_str().into(),
+        is_dir: e.is_dir,
+        is_image: !e.is_dir && in_bucket && is_image(&e.name),
+        size: if e.is_dir {
+            SharedString::new()
+        } else {
+            format_size(e.size).into()
+        },
+        modified: e.modified.map(format_time).unwrap_or_default().into(),
+        selected,
+    }
+}
+
+fn count_status(count: usize, has_more: bool) -> String {
+    if has_more {
+        format!("{count} item(s) loaded, scroll down for more")
+    } else {
+        format!("{count} item(s)")
+    }
+}
+
 // ---- Background work -------------------------------------------------------
 
 async fn upload_files(
@@ -997,6 +1098,7 @@ fn main() -> Result<()> {
     ui.on_close_tab(|i| with_app(|a| a.close_tab(i as usize)));
     ui.on_go_up(|| with_app(|a| a.go_up()));
     ui.on_refresh(|| with_app(|a| a.refresh()));
+    ui.on_load_more(|| with_app(|a| a.load_more()));
     ui.on_upload(|| with_app(|a| a.upload()));
     ui.on_download(|| with_app(|a| a.download()));
     ui.on_delete_selected(|| with_app(|a| a.ask_delete_selected()));
