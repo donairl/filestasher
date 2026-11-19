@@ -43,6 +43,8 @@ struct Tab {
     next_token: Option<String>,
     /// Search text; only entries whose name contains it are shown.
     filter: String,
+    /// True until the first listing after connect arrives.
+    connecting: bool,
     /// Bumped on every load; results from older loads are dropped.
     generation: u64,
 }
@@ -604,6 +606,7 @@ impl App {
                 busy: false,
                 next_token: None,
                 filter: String::new(),
+                connecting: true,
                 generation: 0,
             });
             st.active = Some(st.tabs.len() - 1);
@@ -642,6 +645,10 @@ impl App {
                 None => None,
             };
             st.global_status.clear();
+            // With no tab left, the servers panel is the only way forward.
+            if st.tabs.is_empty() {
+                self.ui().set_sidebar_open(true);
+            }
         }
         self.reset_search_box();
         self.sync_view();
@@ -684,6 +691,12 @@ impl App {
                 return;
             }
             t.busy = false;
+            // A connection that opened makes room for the files. A failed one
+            // keeps the servers panel, since the profile likely needs editing.
+            let connected = std::mem::take(&mut t.connecting) && result.is_ok();
+            if connected {
+                self.ui().set_sidebar_open(false);
+            }
             match result {
                 Ok(page) => {
                     t.selected = vec![false; page.entries.len()];
