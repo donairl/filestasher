@@ -411,6 +411,44 @@ pub async fn delete_keys(client: &Client, bucket: &str, keys: &[String]) -> Resu
     Ok(())
 }
 
+/// Percent-encodes a `bucket/key` for the copy source header.
+fn copy_source(bucket: &str, key: &str) -> String {
+    let mut out = format!("{bucket}/");
+    for b in key.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// S3 has no rename: copies every object to its new key, then deletes the
+/// old ones. A key ending in `/` renames everything under that prefix.
+// ponytail: one request per object and CopyObject stops at 5 GB; use
+// multipart copy (UploadPartCopy) when larger objects must be renamed.
+pub async fn rename(client: &Client, bucket: &str, from: &str, to: &str) -> Result<()> {
+    let keys: Vec<String> = if from.ends_with('/') {
+        let all = list_all(client, bucket, from).await?;
+        all.into_iter().map(|(k, _)| k).collect()
+    } else {
+        vec![from.to_string()]
+    };
+    for key in &keys {
+        client
+            .copy_object()
+            .bucket(bucket)
+            .copy_source(copy_source(bucket, key))
+            .key(format!("{to}{}", &key[from.len()..]))
+            .send()
+            .await
+            .map_err(|e| sdk_err("rename", e))?;
+    }
+    delete_keys(client, bucket, &keys).await
+}
+
 /// `key` must end in `/`.
 pub async fn create_folder(client: &Client, bucket: &str, key: &str) -> Result<()> {
     client

@@ -1,19 +1,22 @@
 # S3 FStasher
 
 A desktop file explorer for S3 and S3-compatible storage (AWS S3, MinIO, Ceph,
-Cloudflare R2, Wasabi, and others), written in Rust with a
+Cloudflare R2, Wasabi, and others), for SFTP servers over SSH, directly or
+through jump hosts, and for FTP servers, written in Rust with a
 [Slint](https://slint.dev) UI.
 
 ## Features
 
-- Saved server profiles: add, edit, delete, and test the connection before
-  saving.
+- Saved server profiles: add, duplicate, edit, delete, and test the connection
+  before saving.
 - Several servers connected at once, each in its own tab.
 - Browse buckets and folders. Large folders load 1000 entries at a time as you
   scroll.
 - Sort by name, size or modified time by clicking a column title. The default
   is newest first.
 - Search the current folder by name.
+- Type or paste a location into the bar above the list and press Enter to go
+  there.
 - Upload files, with multipart upload for files larger than 32 MiB.
 - Download files and whole folders.
 - Image preview: double-click a PNG, JPEG, GIF, BMP, WebP or ICO file.
@@ -24,11 +27,12 @@ Cloudflare R2, Wasabi, and others), written in Rust with a
   or from the S3 list onto it to download.
 - Both side panels can be hidden, and resized by dragging their handles.
 - Asks before overwriting when a file already exists at the destination.
-- Create folders.
+- Create folders. Rename files and folders.
+- Keyboard: F5 refresh, Backspace up, Enter open, Delete delete, F2 rename.
 - Delete files and folders, always after a confirmation.
 - Transfer progress in the status bar.
 
-Not supported yet: rename/copy/move, presigned URLs, preview
+Not supported yet: copy/move, rename in the local pane, presigned URLs, preview
 of non-image files, drag and drop from other applications, creating or
 deleting buckets.
 
@@ -54,7 +58,8 @@ The binary is written to `target/release/s3-fstasher`.
 2. Double-click a server, or select it and click **Connect**. Each connection
    opens in a new tab.
 3. Double-click a bucket or folder to open it. **Up** goes one level back.
-4. Click a row to select it. Ctrl+click selects several rows.
+4. Click a row to select it. Ctrl+click selects several rows, Shift+click
+   selects a range. The keyboard shortcuts act on the list clicked last.
 5. Use **Upload**, **Download**, **New Folder** and **Delete** on the toolbar.
 
 ### Server settings
@@ -70,6 +75,39 @@ The binary is written to `target/release/s3-fstasher`.
 | Path-style     | Enable for MinIO, Ceph and most self-hosted servers.            |
 
 Set a default bucket when the credentials are not allowed to list buckets.
+
+### SFTP (SSH) settings
+
+Choose **SFTP (SSH)** as the protocol to browse a server over SSH.
+
+| Field         | Notes                                                              |
+| ------------- | ------------------------------------------------------------------ |
+| Host          | `user@host` or `user@host:port`. Port 22 when left out.            |
+| Password      | Login password. Also the passphrase of the key file. Optional.     |
+| Key file      | Private key. Blank tries `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`. |
+| Start folder  | Folder the tab opens in. Blank opens the home folder.              |
+| Jump host     | Optional `user@host:port` to tunnel through, like `ssh -J`. Several hosts, comma separated, are chained in order. |
+| Jump password | Password for the jump hosts. Blank uses **Password**.              |
+
+The key file is tried first, then the password; the same key file is used on
+the jump hosts. Host keys are checked against `~/.ssh/known_hosts`: for a host
+seen for the first time the app shows the key fingerprint and asks before
+adding it, and a host whose key changed is refused.
+ssh-agent and one-time-code (keyboard-interactive) logins are not supported.
+
+### FTP settings
+
+Choose **FTP** as the protocol.
+
+| Field        | Notes                                                              |
+| ------------ | ------------------------------------------------------------------ |
+| Host         | `user@host` or `user@host:port`. Port 21 when left out; without a user the login is `anonymous`. |
+| Password     | Login password.                                                    |
+| Start folder | Folder the tab opens in. Blank opens the folder the server logs you into. |
+
+> **Security:** this is plain FTP, in passive mode. The password and the files
+> travel unencrypted; FTPS (FTP over TLS) is not supported. Prefer SFTP when
+> the server offers it.
 
 ## Configuration file
 
@@ -90,9 +128,23 @@ access_key = "..."
 secret_key = "..."
 path_style = true
 bucket = ""
+
+[[servers]]
+name = "app-server"
+protocol = "sftp"
+host = "deploy@10.0.0.5"
+key_file = "~/.ssh/id_ed25519"
+jump = "ops@bastion.example.com:2222"
+bucket = "/var/www"
+
+[[servers]]
+name = "old-nas"
+protocol = "ftp"
+host = "backup@192.168.1.20"
+password = "..."
 ```
 
-> **Security:** secret keys are stored in plaintext. Anyone who can read this
+> **Security:** secret keys and SSH and FTP passwords are stored in plaintext. Anyone who can read this
 > file gets full access to those servers. On Unix the file is created with mode
 > `0600`, which only protects it from other users on the same machine. Do not
 > commit or share this file.
@@ -105,6 +157,20 @@ bucket = ""
   undone.
 - Downloads go to a folder you pick. Object keys that would escape that folder,
   such as keys containing `..`, are skipped and counted in the status message.
+- On SFTP and FTP, folders are real folders and a whole folder is listed at once.
+  Deleting a link to a folder removes the link, not what it points to; a
+  linked folder cannot be downloaded as part of a folder download.
+- A file that fails during an upload or download is skipped; the rest of the
+  batch continues and the status bar reports how many failed, with the first
+  error.
+- **Cancel** in the status bar stops all running transfers. The file that was
+  in progress is removed again; files already transferred stay. On S3, the
+  parts of a cancelled large upload stay on the server until the bucket's
+  lifecycle rule for incomplete multipart uploads removes them.
+- **Rename** is in the right-click menu. It refuses a name that is already
+  taken. S3 has no rename: every object is copied to its new key and the old
+  one deleted, so renaming a large folder takes one request per object, and
+  objects over 5 GB cannot be renamed.
 - Errors are shown in the status bar of the tab.
 
 ## Project layout
@@ -113,6 +179,9 @@ bucket = ""
 | --------------- | ---------------------------------------------------------- |
 | `src/main.rs`   | Application state, UI callbacks, background jobs.          |
 | `src/s3.rs`     | S3 operations on top of `aws-sdk-s3`.                      |
+| `src/sftp.rs`   | SFTP operations and SSH jump hosts on top of `russh`.      |
+| `src/ftp.rs`    | FTP operations on top of `suppaftp`.                       |
+| `src/remote.rs` | Picks S3, SFTP or FTP for a tab.                           |
 | `src/config.rs` | Server profiles, load and save.                            |
 | `src/util.rs`   | Size and time formatting, prefix navigation, safe paths.   |
 | `ui/app.slint`  | Window, sidebar, tabs, file list and dialogs.              |

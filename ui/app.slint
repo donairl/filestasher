@@ -1,4 +1,4 @@
-import { Button, LineEdit, CheckBox, ListView, ProgressIndicator, Spinner, Palette } from "std-widgets.slint";
+import { Button, LineEdit, CheckBox, ComboBox, ListView, ProgressIndicator, Spinner, Palette } from "std-widgets.slint";
 
 export struct ServerItem {
     name: string,
@@ -185,6 +185,7 @@ export component MainWindow inherits Window {
     callback add-server();
     callback edit-server(int);
     callback delete-server(int);
+    callback duplicate-server(int);
 
     // Tabs
     in property <[string]> tabs;
@@ -193,7 +194,9 @@ export component MainWindow inherits Window {
     callback close-tab(int);
 
     // Active tab view
-    in property <string> location;
+    in-out property <string> location;
+    // A location typed into the bar and confirmed with Enter.
+    callback go-to(string);
     in property <[FileEntry]> entries;
     in property <string> status;
     in property <bool> busy;
@@ -218,6 +221,14 @@ export component MainWindow inherits Window {
     callback delete-selected();
     callback create-folder(string);
     callback row-clicked(int, bool);
+    // Shift+click: selects from the last clicked row to this one.
+    callback row-range(int);
+    callback ask-rename();
+    callback rename(string);
+    // Enter: opens the one selected row; true = in the local pane.
+    callback activate-selected(bool);
+    // The pane that was clicked last gets the keyboard shortcuts.
+    property <bool> keys-local;
     callback row-activated(int);
     callback row-context(int);
     // Copies the paths of the selected rows; true = as s3:// URIs.
@@ -239,6 +250,7 @@ export component MainWindow inherits Window {
     callback local-refresh();
     callback local-choose();
     callback local-row-clicked(int, bool);
+    callback local-row-range(int);
     callback local-row-context(int);
     callback local-row-activated(int);
     in property <int> local-sort-column: 2;
@@ -255,7 +267,26 @@ export component MainWindow inherits Window {
     property <bool> drag-from-local;
     property <length> drag-x;
     property <length> drag-y;
-    property <length> local-width: 420px;
+    // The remote and local lists start equally wide: half of the room next
+    // to the servers panel each, until the divider is dragged. Set from
+    // change handlers because a binding on the window width would loop
+    // through the layout. The start value fits the preferred window size.
+    property <length> local-width: (1420px - 28px - 230px) / 2;
+    property <bool> local-auto: true;
+    function balance() {
+        if (root.local-auto) {
+            root.local-width = max(root.panel-min, (root.width - 28px - (root.sidebar-open ? root.sidebar-width : 0px)) / 2);
+        }
+    }
+    changed width => {
+        root.balance();
+    }
+    changed sidebar-open => {
+        root.balance();
+    }
+    changed sidebar-width => {
+        root.balance();
+    }
     // Column widths of the local pane grow with it, so a wider pane does not
     // give all the extra room to the name column.
     property <length> local-size-col: max(72px, root.local-width * 0.17);
@@ -299,9 +330,19 @@ export component MainWindow inherits Window {
     in-out property <string> form-secret-key;
     in-out property <string> form-bucket;
     in-out property <bool> form-path-style;
+    // 0 = S3, 1 = SFTP, 2 = FTP.
+    in-out property <int> form-protocol;
+    property <bool> form-s3: root.form-protocol == 0;
+    property <bool> form-sftp: root.form-protocol == 1;
+    in-out property <string> form-host;
+    in-out property <string> form-password;
+    in-out property <string> form-key-file;
+    in-out property <string> form-jump;
+    in-out property <string> form-jump-password;
     in property <string> form-message;
     callback save-server();
     callback test-server();
+    callback browse-key-file();
 
     // Image preview
     in-out property <bool> preview-open;
@@ -318,16 +359,61 @@ export component MainWindow inherits Window {
     // Confirm dialog
     in-out property <bool> confirm-open;
     in property <string> confirm-text;
+    in property <string> confirm-title: "Confirm delete";
+    // Label of the button that says yes.
+    in property <string> confirm-action: "Delete";
     callback confirm-accepted();
+    callback confirm-rejected();
+    callback cancel-transfers();
 
     // New folder dialog
     in-out property <bool> newfolder-open;
     in-out property <string> newfolder-name;
+    // The dialog renames the selected entry instead of creating a folder.
+    in-out property <bool> renaming;
 
     clipboard := TextInput {
         visible: false;
         width: 0px;
         height: 0px;
+    }
+
+    // Keyboard shortcuts of the file lists. Focused by a click on a row, so
+    // keys typed into a text field never land here.
+    keys := FocusScope {
+        width: 0px;
+        height: 0px;
+        key-pressed(ev) => {
+            if (root.preview-open && ev.text == Key.Escape) {
+                root.preview-open = false;
+                return accept;
+            }
+            if (root.server-dialog-open || root.newfolder-open || root.conflict-open || root.confirm-open || root.preview-open) {
+                return reject;
+            }
+            if (ev.text == Key.F5) {
+                if (root.keys-local) {
+                    root.local-refresh();
+                } else {
+                    root.refresh();
+                }
+            } else if (ev.text == Key.Backspace) {
+                if (root.keys-local) {
+                    root.local-up();
+                } else if (root.can-go-up) {
+                    root.go-up();
+                }
+            } else if (ev.text == Key.Return) {
+                root.activate-selected(root.keys-local);
+            } else if (ev.text == Key.Delete && !root.keys-local && root.in-bucket) {
+                root.delete-selected();
+            } else if (ev.text == Key.F2 && !root.keys-local && root.in-bucket) {
+                root.ask-rename();
+            } else {
+                return reject;
+            }
+            return accept;
+        }
     }
 
     HorizontalLayout {
@@ -402,6 +488,17 @@ export component MainWindow inherits Window {
                         }
                     }
 
+                    Button {
+                        text: "Duplicate";
+                        enabled: root.selected-server >= 0;
+                        clicked => {
+                            root.duplicate-server(root.selected-server);
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 4px;
                     Button {
                         text: "Edit";
                         icon: @image-url("icons/edit.svg");
@@ -550,11 +647,13 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                Text {
-                    text: root.location;
+                LineEdit {
+                    text <=> root.location;
                     horizontal-stretch: 1;
-                    vertical-alignment: center;
-                    overflow: elide;
+                    accepted(text) => {
+                        root.go-to(text);
+                        keys.focus();
+                    }
                 }
 
                 if root.search-open: Text {
@@ -617,6 +716,7 @@ export component MainWindow inherits Window {
                     enabled: root.in-bucket;
                     clicked => {
                         root.newfolder-name = "";
+                        root.renaming = false;
                         root.newfolder-open = true;
                     }
                 }
@@ -714,6 +814,13 @@ export component MainWindow inherits Window {
                                 }
                             }
                             MenuItem {
+                                title: "Rename";
+                                enabled: root.in-bucket;
+                                activated => {
+                                    root.ask-rename();
+                                }
+                            }
+                            MenuItem {
                                 title: "Download";
                                 enabled: root.in-bucket;
                                 activated => {
@@ -728,12 +835,16 @@ export component MainWindow inherits Window {
                         property <bool> dragged;
                         pointer-event(ev) => {
                             if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
-                                self.ctrl-down = ev.modifiers.control;
+                                self.ctrl-down = ev.modifiers.control || ev.modifiers.shift;
                                 self.dragged = false;
                                 root.drag-active = false;
+                                root.keys-local = false;
+                                keys.focus();
                                 // A plain press keeps a selection that contains the
                                 // row, so several rows can be dragged together.
-                                if (ev.modifiers.control) {
+                                if (ev.modifiers.shift) {
+                                    root.row-range(i);
+                                } else if (ev.modifiers.control) {
                                     root.row-clicked(i, true);
                                 } else {
                                     root.row-context(i);
@@ -839,6 +950,14 @@ export component MainWindow inherits Window {
                             progress: root.transfer-progress;
                         }
                     }
+                    if root.transfer-count > 0: Button {
+                        text: "Cancel";
+                        icon: @image-url("icons/close.svg");
+                        colorize-icon: true;
+                        clicked => {
+                            root.cancel-transfers();
+                        }
+                    }
                 }
             }
         }
@@ -872,6 +991,7 @@ export component MainWindow inherits Window {
                             self.dragged = true;
                         }
                         if (self.dragged) {
+                            root.local-auto = false;
                             root.local-width = max(root.panel-min, min(root.local-max, root.width - self.pointer-x - 7px));
                         }
                     }
@@ -1009,10 +1129,14 @@ export component MainWindow inherits Window {
                             property <bool> dragged;
                             pointer-event(ev) => {
                                 if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
-                                    self.ctrl-down = ev.modifiers.control;
+                                    self.ctrl-down = ev.modifiers.control || ev.modifiers.shift;
                                     self.dragged = false;
                                     root.drag-active = false;
-                                    if (ev.modifiers.control) {
+                                    root.keys-local = true;
+                                    keys.focus();
+                                    if (ev.modifiers.shift) {
+                                        root.local-row-range(i);
+                                    } else if (ev.modifiers.control) {
                                         root.local-row-clicked(i, true);
                                     } else {
                                         root.local-row-context(i);
@@ -1174,38 +1298,102 @@ export component MainWindow inherits Window {
             value <=> root.form-name;
         }
 
-        Field {
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Protocol";
+                width: 110px;
+                vertical-alignment: center;
+            }
+
+            ComboBox {
+                horizontal-stretch: 1;
+                model: ["S3", "SFTP (SSH)", "FTP"];
+                current-index <=> root.form-protocol;
+            }
+        }
+
+        if root.form-s3: Field {
             label: "Endpoint URL";
             hint: "https://… (blank for AWS)";
             value <=> root.form-endpoint;
         }
 
-        Field {
+        if root.form-s3: Field {
             label: "Region";
             hint: "us-east-1";
             value <=> root.form-region;
         }
 
-        Field {
+        if root.form-s3: Field {
             label: "Access key";
             value <=> root.form-access-key;
         }
 
-        Field {
+        if root.form-s3: Field {
             label: "Secret key";
             secret: true;
             value <=> root.form-secret-key;
         }
 
-        Field {
+        if root.form-s3: Field {
             label: "Default bucket";
             hint: "optional";
             value <=> root.form-bucket;
         }
 
-        CheckBox {
+        if root.form-s3: CheckBox {
             text: "Path-style addressing (MinIO, Ceph)";
             checked <=> root.form-path-style;
+        }
+
+        if !root.form-s3: Field {
+            label: "Host";
+            hint: "user@host:port";
+            value <=> root.form-host;
+        }
+
+        if !root.form-s3: Field {
+            label: "Password";
+            hint: root.form-sftp ? "login password / key passphrase" : "login password";
+            secret: true;
+            value <=> root.form-password;
+        }
+
+        if root.form-sftp: HorizontalLayout {
+            spacing: 6px;
+            Field {
+                horizontal-stretch: 1;
+                label: "Key file";
+                hint: "blank: ~/.ssh/id_ed25519, id_ecdsa, id_rsa";
+                value <=> root.form-key-file;
+            }
+
+            Button {
+                text: "Browse";
+                clicked => {
+                    root.browse-key-file();
+                }
+            }
+        }
+
+        if !root.form-s3: Field {
+            label: "Start folder";
+            hint: "blank: home folder";
+            value <=> root.form-bucket;
+        }
+
+        if root.form-sftp: Field {
+            label: "Jump host";
+            hint: "optional, user@host:port (comma separated)";
+            value <=> root.form-jump;
+        }
+
+        if root.form-sftp: Field {
+            label: "Jump password";
+            hint: "blank: same as password";
+            secret: true;
+            value <=> root.form-jump-password;
         }
 
         Text {
@@ -1251,14 +1439,24 @@ export component MainWindow inherits Window {
     }
 
     if root.newfolder-open: Modal {
-        title: "New folder";
+        title: root.renaming ? "Rename" : "New folder";
         box-width: 380px;
+        function done() {
+            root.newfolder-open = false;
+            if (root.renaming) {
+                root.rename(root.newfolder-name);
+            } else {
+                root.create-folder(root.newfolder-name);
+            }
+        }
         LineEdit {
             text <=> root.newfolder-name;
-            placeholder-text: "Folder name";
+            placeholder-text: root.renaming ? "New name" : "Folder name";
+            init => {
+                self.focus();
+            }
             accepted => {
-                root.newfolder-open = false;
-                root.create-folder(root.newfolder-name);
+                done();
             }
         }
 
@@ -1275,13 +1473,12 @@ export component MainWindow inherits Window {
             }
 
             Button {
-                text: "Create";
-                icon: @image-url("icons/folder-plus.svg");
+                text: root.renaming ? "Rename" : "Create";
+                icon: root.renaming ? @image-url("icons/check.svg") : @image-url("icons/folder-plus.svg");
                 colorize-icon: true;
                 primary: true;
                 clicked => {
-                    root.newfolder-open = false;
-                    root.create-folder(root.newfolder-name);
+                    done();
                 }
             }
         }
@@ -1328,7 +1525,7 @@ export component MainWindow inherits Window {
     }
 
     if root.confirm-open: Modal {
-        title: "Confirm delete";
+        title: root.confirm-title;
         box-width: 420px;
         Text {
             text: root.confirm-text;
@@ -1344,12 +1541,13 @@ export component MainWindow inherits Window {
                 colorize-icon: true;
                 clicked => {
                     root.confirm-open = false;
+                    root.confirm-rejected();
                 }
             }
 
             Button {
-                text: "Delete";
-                icon: @image-url("icons/trash.svg");
+                text: root.confirm-action;
+                icon: root.confirm-action == "Delete" ? @image-url("icons/trash.svg") : @image-url("icons/check.svg");
                 colorize-icon: true;
                 primary: true;
                 clicked => {

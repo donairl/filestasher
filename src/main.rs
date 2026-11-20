@@ -7,7 +7,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod config;
+mod ftp;
+mod remote;
 mod s3;
+mod sftp;
 mod util;
 
 use std::cell::RefCell;
@@ -15,14 +18,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use aws_sdk_s3::Client;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
-use config::{Config, ServerProfile};
+use config::{Config, Protocol, ServerProfile};
+use remote::Remote;
 use s3::{Entry, Page};
 use util::{format_size, format_time, is_image, parent_prefix, safe_join};
 
@@ -31,7 +34,7 @@ slint::include_modules!();
 struct Tab {
     id: u64,
     title: String,
-    client: Client,
+    client: Remote,
     /// `None` shows the bucket list.
     bucket: Option<String>,
     prefix: String,
@@ -56,7 +59,7 @@ impl Tab {
     fn location(&self) -> String {
         match &self.bucket {
             None => "s3://".to_string(),
-            Some(b) => format!("s3://{b}/{}", self.prefix),
+            Some(b) => self.client.uri(b, &self.prefix),
         }
     }
 
@@ -109,7 +112,7 @@ enum TransferKind {
 /// A planned upload or download, ready to run.
 struct Transfer {
     tab_id: u64,
-    client: Client,
+    client: Remote,
     bucket: String,
     kind: TransferKind,
     files: Vec<TransferFile>,
@@ -135,7 +138,7 @@ impl Transfer {
             .collect();
         let place = match &self.kind {
             TransferKind::Download { dest } => dest.display().to_string(),
-            TransferKind::Upload { prefix } => format!("s3://{}/{prefix}", self.bucket),
+            TransferKind::Upload { prefix } => self.client.uri(&self.bucket, prefix),
         };
         let mut text = format!(
             "{} of {} file(s) already exist in {place}:\n",
@@ -151,30 +154,101 @@ impl Transfer {
         text
     }
 
-    /// Transfers every file, in order. Returns the file count.
-    async fn run(&self) -> Result<usize> {
+    /// Transfers every file, in order. A file that fails is skipped and
+    /// reported; Cancel stops the file in progress and leaves out the rest.
+    async fn run(&self) -> Outcome {
         let job = Job::start(self.files.iter().map(|f| f.size).sum());
+        let mut cancel = CANCEL.subscribe();
+        let mut out = Outcome::default();
         for f in &self.files {
             let progress = |n| job.add(n);
-            match self.kind {
-                TransferKind::Download { .. } => {
-                    s3::download_file(&self.client, &self.bucket, &f.key, &f.local, &progress)
-                        .await?
+            let one = async {
+                match self.kind {
+                    TransferKind::Download { .. } => {
+                        self.client
+                            .download_file(&self.bucket, &f.key, &f.local, &progress)
+                            .await
+                    }
+                    TransferKind::Upload { .. } => {
+                        self.client
+                            .upload_file(&self.bucket, &f.key, &f.local, &progress)
+                            .await
+                    }
                 }
-                TransferKind::Upload { .. } => {
-                    s3::upload_file(&self.client, &self.bucket, &f.key, &f.local, &progress)
-                        .await?
+            };
+            let result = tokio::select! {
+                r = one => r,
+                _ = cancel.changed() => {
+                    out.cancelled = true;
+                    self.discard_partial(f).await;
+                    break;
                 }
+            };
+            match result {
+                Ok(()) => out.done += 1,
+                Err(e) => out.failed.push(format!("{}: {e:#}", f.key)),
             }
         }
-        Ok(self.files.len())
+        out
+    }
+
+    /// Removes what a cancelled transfer left of `f`.
+    async fn discard_partial(&self, f: &TransferFile) {
+        match self.kind {
+            TransferKind::Download { .. } => {
+                let _ = tokio::fs::remove_file(&f.local).await;
+            }
+            // S3 replaces an object only when its upload completes, so the
+            // key still holds the old object, if any, and must stay.
+            // ponytail: the parts of a cancelled S3 multipart upload stay on
+            // the server until a bucket lifecycle rule or an abort removes
+            // them. Abort here when that storage starts to matter.
+            TransferKind::Upload { .. } if matches!(self.client, Remote::S3(_)) => {}
+            // SFTP and FTP write in place: a half-written file is left.
+            TransferKind::Upload { .. } => {
+                let _ = self
+                    .client
+                    .delete_keys(&self.bucket, std::slice::from_ref(&f.key))
+                    .await;
+            }
+        }
     }
 }
+
+/// How a transfer ended.
+#[derive(Default)]
+struct Outcome {
+    done: usize,
+    /// One line per file that failed: its key and the error.
+    failed: Vec<String>,
+    cancelled: bool,
+}
+
+impl Outcome {
+    /// Tail of the status message; empty when every file went through.
+    fn summary(&self, planned: usize) -> String {
+        let mut text = String::new();
+        if self.cancelled {
+            let left = planned - self.done - self.failed.len();
+            text.push_str(&format!(", cancelled with {left} left"));
+        }
+        if let Some(first) = self.failed.first() {
+            text.push_str(&format!(", {} failed, first: {first}", self.failed.len()));
+        }
+        text
+    }
+}
+
+/// Bumped by the Cancel button; every running transfer watches it.
+// ponytail: cancels all running transfers at once. Give each job its own
+// channel when transfers get a list with a button per row.
+static CANCEL: LazyLock<tokio::sync::watch::Sender<u64>> =
+    LazyLock::new(|| tokio::sync::watch::channel(0).0);
 
 /// Where a previewed image comes from.
 enum PreviewSource {
     Remote {
-        client: Client,
+        client: Remote,
         bucket: String,
         key: String,
     },
@@ -182,6 +256,9 @@ enum PreviewSource {
 }
 
 enum Pending {
+    /// An SSH host seen for the first time; the answer goes to the
+    /// connection that waits for it. Dropping it answers no.
+    TrustHost(tokio::sync::oneshot::Sender<bool>),
     DeleteServer(usize),
     DeleteObjects {
         tab_id: u64,
@@ -221,6 +298,9 @@ struct State {
     /// For each row on screen, its index in the active tab's entries. Differs
     /// from the identity while a search filter hides entries.
     visible: Vec<usize>,
+    /// Row clicked last in each list, where a Shift+click range starts.
+    anchor: usize,
+    local_anchor: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -455,10 +535,11 @@ impl App {
             .iter()
             .map(|s| ServerItem {
                 name: s.name.as_str().into(),
-                endpoint: if s.endpoint.is_empty() {
-                    format!("AWS {}", s.region).into()
-                } else {
-                    s.endpoint.as_str().into()
+                endpoint: match s.protocol {
+                    Protocol::Sftp => format!("sftp://{}", s.host).into(),
+                    Protocol::Ftp => format!("ftp://{}", s.host).into(),
+                    Protocol::S3 if s.endpoint.is_empty() => format!("AWS {}", s.region).into(),
+                    Protocol::S3 => s.endpoint.as_str().into(),
                 },
             })
             .collect();
@@ -630,10 +711,11 @@ impl App {
 
     // ---- Servers ---------------------------------------------------------
 
-    fn open_server_dialog(&self, index: Option<usize>) {
+    /// `duplicate` opens a copy of the profile at `index` as a new one.
+    fn open_server_dialog(&self, index: Option<usize>, duplicate: bool) {
         let profile = {
             let mut st = self.state.borrow_mut();
-            let profile = match index {
+            let mut profile = match index {
                 Some(i) => match st.config.servers.get(i) {
                     Some(p) => p.clone(),
                     None => return,
@@ -643,12 +725,15 @@ impl App {
                     ..Default::default()
                 },
             };
-            st.editing = index;
+            if duplicate {
+                profile.name.push_str(" copy");
+            }
+            st.editing = index.filter(|_| !duplicate);
             profile
         };
         let ui = self.ui();
         ui.set_server_dialog_title(
-            if index.is_some() {
+            if index.is_some() && !duplicate {
                 "Edit server"
             } else {
                 "Add server"
@@ -662,6 +747,12 @@ impl App {
         ui.set_form_secret_key(profile.secret_key.into());
         ui.set_form_bucket(profile.bucket.into());
         ui.set_form_path_style(profile.path_style);
+        ui.set_form_protocol(profile.protocol as i32);
+        ui.set_form_host(profile.host.into());
+        ui.set_form_password(profile.password.into());
+        ui.set_form_key_file(profile.key_file.into());
+        ui.set_form_jump(profile.jump.into());
+        ui.set_form_jump_password(profile.jump_password.into());
         ui.set_form_message(SharedString::new());
         ui.set_server_dialog_open(true);
     }
@@ -677,9 +768,40 @@ impl App {
             secret_key: ui.get_form_secret_key().trim().to_string(),
             path_style: ui.get_form_path_style(),
             bucket: ui.get_form_bucket().trim().to_string(),
+            protocol: Protocol::from_index(ui.get_form_protocol()),
+            host: ui.get_form_host().trim().to_string(),
+            // Passwords may start or end with a space.
+            password: ui.get_form_password().to_string(),
+            key_file: ui.get_form_key_file().trim().to_string(),
+            jump: ui.get_form_jump().trim().to_string(),
+            jump_password: ui.get_form_jump_password().to_string(),
         };
         if p.name.is_empty() {
             return Err("Name is required.".into());
+        }
+        let default_port = match p.protocol {
+            Protocol::S3 => 0,
+            Protocol::Sftp => 22,
+            Protocol::Ftp => 21,
+        };
+        if p.protocol != Protocol::S3 {
+            if p.host.is_empty() {
+                return Err("Host is required.".into());
+            }
+            // Jump hosts are an SFTP setting; FTP ignores them.
+            let jumps = match p.protocol {
+                Protocol::Sftp => p.jump.as_str(),
+                _ => "",
+            };
+            let hosts = jumps.split(',').filter(|j| !j.trim().is_empty());
+            for spec in hosts.chain([p.host.as_str()]) {
+                // FTP without a user logs in as anonymous.
+                if p.protocol == Protocol::Ftp && !spec.contains('@') {
+                    continue;
+                }
+                sftp::parse_host(spec, default_port).map_err(|e| format!("{e:#}."))?;
+            }
+            return Ok(p);
         }
         if !p.endpoint.is_empty()
             && !p.endpoint.starts_with("http://")
@@ -718,6 +840,19 @@ impl App {
         }
     }
 
+    fn browse_key_file(&self) {
+        self.rt.spawn(async move {
+            let mut dialog = rfd::AsyncFileDialog::new().set_title("SSH private key");
+            if let Some(ssh) = std::env::home_dir().map(|h| h.join(".ssh")) {
+                dialog = dialog.set_directory(ssh);
+            }
+            if let Some(file) = dialog.pick_file().await {
+                let path = file.path().display().to_string();
+                on_ui(move |app| app.ui().set_form_key_file(path.into()));
+            }
+        });
+    }
+
     fn test_server(&self) {
         let ui = self.ui();
         let profile = match self.form_profile() {
@@ -726,9 +861,9 @@ impl App {
         };
         ui.set_form_message("Testing…".into());
         let _guard = self.rt.enter();
-        let client = s3::build_client(&profile);
+        let client = Remote::new(&profile);
         self.rt.spawn(async move {
-            let msg = match s3::test_connection(&client, &profile.bucket).await {
+            let msg = match client.test_connection(&profile.bucket).await {
                 Ok(m) => m,
                 Err(e) => format!("Connection failed: {e:#}"),
             };
@@ -746,9 +881,11 @@ impl App {
             st.pending = Some(Pending::DeleteServer(index));
             name
         };
-        let ui = self.ui();
-        ui.set_confirm_text(format!("Remove server \"{name}\" from the saved settings?").into());
-        ui.set_confirm_open(true);
+        self.open_confirm(
+            "Confirm delete",
+            "Delete",
+            format!("Remove server \"{name}\" from the saved settings?"),
+        );
     }
 
     fn connect(&self, index: usize) {
@@ -757,8 +894,9 @@ impl App {
         };
         let client = {
             let _guard = self.rt.enter();
-            s3::build_client(&profile)
+            Remote::new(&profile)
         };
+        let tab_client = client.clone();
         let id = {
             let mut st = self.state.borrow_mut();
             st.next_tab_id += 1;
@@ -766,8 +904,13 @@ impl App {
             st.tabs.push(Tab {
                 id,
                 title: profile.name.clone(),
-                client,
-                bucket: (!profile.bucket.is_empty()).then(|| profile.bucket.clone()),
+                client: tab_client,
+                // SFTP and FTP have no buckets: one unnamed, pinned bucket
+                // holds the whole remote file system.
+                bucket: match profile.protocol {
+                    Protocol::S3 => (!profile.bucket.is_empty()).then(|| profile.bucket.clone()),
+                    _ => Some(String::new()),
+                },
                 prefix: String::new(),
                 entries: Vec::new(),
                 selected: Vec::new(),
@@ -776,14 +919,34 @@ impl App {
                 next_token: None,
                 filter: String::new(),
                 connecting: true,
-                pinned_bucket: !profile.bucket.is_empty(),
+                pinned_bucket: profile.protocol != Protocol::S3 || !profile.bucket.is_empty(),
                 generation: 0,
             });
             st.active = Some(st.tabs.len() - 1);
             id
         };
         self.reset_search_box();
-        self.load(id);
+        if profile.protocol == Protocol::S3 {
+            return self.load(id);
+        }
+        // The start folder is known only once connected.
+        if let Some(t) = self.state.borrow_mut().tab_mut(id) {
+            t.busy = true;
+            t.status = "Connecting…".into();
+        }
+        self.sync_view();
+        self.rt.spawn(async move {
+            let start = client.start_prefix().await;
+            on_ui(move |app| match start {
+                Ok(prefix) => {
+                    if let Some(t) = app.state.borrow_mut().tab_mut(id) {
+                        t.prefix = prefix;
+                    }
+                    app.load(id);
+                }
+                Err(e) => app.loaded(id, 0, Err(e)),
+            });
+        });
     }
 
     // ---- Tabs and navigation ---------------------------------------------
@@ -842,11 +1005,11 @@ impl App {
         self.sync_view();
         self.rt.spawn(async move {
             let result = match &bucket {
-                None => s3::list_buckets(&client).await.map(|entries| Page {
+                None => client.list_buckets().await.map(|entries| Page {
                     entries,
                     next: None,
                 }),
-                Some(b) => s3::list_page(&client, b, &prefix, None).await,
+                Some(b) => client.list_page(b, &prefix, None).await,
             };
             on_ui(move |app| app.loaded(tab_id, generation, result));
         });
@@ -913,7 +1076,7 @@ impl App {
         };
         self.sync_status();
         self.rt.spawn(async move {
-            let result = s3::list_page(&client, &bucket, &prefix, Some(token)).await;
+            let result = client.list_page(&bucket, &prefix, Some(token)).await;
             on_ui(move |app| app.loaded_more(tab_id, generation, result));
         });
     }
@@ -1006,13 +1169,56 @@ impl App {
         self.load(id);
     }
 
+    /// Opens the location typed into the bar.
+    fn go_to(&self, text: &str) {
+        let id = {
+            let mut st = self.state.borrow_mut();
+            let Some(t) = st.active_tab_mut() else { return };
+            let (bucket, prefix) = parse_location(text, matches!(t.client, Remote::S3(_)));
+            if t.pinned_bucket && bucket != t.bucket {
+                t.status = "This tab cannot leave its bucket.".into();
+                None
+            } else {
+                t.bucket = bucket;
+                t.prefix = prefix;
+                t.filter.clear();
+                Some(t.id)
+            }
+        };
+        match id {
+            Some(id) => {
+                self.reset_search_box();
+                self.load(id);
+            }
+            // Puts the real location back into the bar.
+            None => self.sync_status(),
+        }
+    }
+
+    /// Shows the active tab's selection in the rows on screen.
+    fn sync_selection(&self) {
+        let shown: Vec<bool> = {
+            let st = self.state.borrow();
+            let Some(t) = st.active_tab() else { return };
+            st.visible.iter().map(|&i| t.selected[i]).collect()
+        };
+        for (i, sel) in shown.into_iter().enumerate() {
+            if let Some(mut row) = self.entries.row_data(i)
+                && row.selected != sel
+            {
+                row.selected = sel;
+                self.entries.set_row_data(i, row);
+            }
+        }
+    }
+
     fn row_clicked(&self, row: usize, toggle: bool) {
         let Some(index) = self.entry_index(row) else {
             return;
         };
-        let shown: Vec<bool> = {
+        {
             let mut st = self.state.borrow_mut();
-            let visible = st.visible.clone();
+            st.anchor = row;
             let Some(t) = st.active_tab_mut() else { return };
             if index >= t.selected.len() {
                 return;
@@ -1024,15 +1230,48 @@ impl App {
                     *sel = i == index;
                 }
             }
-            visible.iter().map(|&i| t.selected[i]).collect()
-        };
-        for (i, sel) in shown.into_iter().enumerate() {
-            if let Some(mut row) = self.entries.row_data(i)
-                && row.selected != sel
-            {
-                row.selected = sel;
-                self.entries.set_row_data(i, row);
+        }
+        self.sync_selection();
+    }
+
+    /// Shift+click: selects the rows from the last clicked one to `row`.
+    fn row_range(&self, row: usize) {
+        {
+            let mut st = self.state.borrow_mut();
+            if row >= st.visible.len() {
+                return;
             }
+            let anchor = st.anchor.min(st.visible.len() - 1);
+            let range = st.visible[anchor.min(row)..=anchor.max(row)].to_vec();
+            let Some(t) = st.active_tab_mut() else { return };
+            t.selected.fill(false);
+            for i in range {
+                t.selected[i] = true;
+            }
+        }
+        self.sync_selection();
+    }
+
+    /// Enter: opens the selected row when exactly one is selected.
+    fn activate_selected(&self, local: bool) {
+        let rows: Vec<usize> = {
+            let st = self.state.borrow();
+            let selected = |i: &usize| match (local, st.active_tab()) {
+                (true, _) => st.local_selected[*i],
+                (false, Some(t)) => t.selected[st.visible[*i]],
+                (false, None) => false,
+            };
+            let count = if local {
+                st.local_selected.len()
+            } else {
+                st.visible.len()
+            };
+            (0..count).filter(selected).collect()
+        };
+        match rows[..] {
+            [row] if local => self.local_row_activated(row),
+            [row] => self.row_activated(row),
+            _ => {}
         }
     }
 
@@ -1062,10 +1301,10 @@ impl App {
                 .selected_entries()
                 .iter()
                 .map(|e| match (&t.bucket, as_uri) {
-                    (Some(b), true) => format!("s3://{b}/{}", e.key),
+                    (Some(b), true) => t.client.uri(b, &e.key),
                     // In the bucket list the key is the bucket name.
                     (None, true) => format!("s3://{}", e.key),
-                    (_, false) => e.key.clone(),
+                    (_, false) => t.client.path(&e.key),
                 })
                 .collect();
             if paths.is_empty() {
@@ -1163,8 +1402,8 @@ impl App {
         self.load(id);
     }
 
-    /// Client, bucket and prefix of the active tab, when it is inside a bucket.
-    fn active_target(&self) -> Option<(u64, Client, String, String)> {
+    /// Remote, bucket and prefix of the active tab, when it is inside a bucket.
+    fn active_target(&self) -> Option<(u64, Remote, String, String)> {
         let st = self.state.borrow();
         let t = st.active_tab()?;
         Some((t.id, t.client.clone(), t.bucket.clone()?, t.prefix.clone()))
@@ -1279,16 +1518,15 @@ impl App {
     /// `skipped_existing` is only reported in the final status.
     fn run_transfer(&self, plan: Transfer, skipped_existing: usize) {
         self.rt.spawn(async move {
-            let result = plan.run().await;
+            let out = plan.run().await;
             on_ui(move |app| {
-                let mut msg = match (&result, &plan.kind) {
-                    (Ok(n), TransferKind::Download { dest }) => {
-                        format!("Downloaded {n} file(s) to {}", dest.display())
+                let mut msg = match &plan.kind {
+                    TransferKind::Download { dest } => {
+                        format!("Downloaded {} file(s) to {}", out.done, dest.display())
                     }
-                    (Ok(n), TransferKind::Upload { .. }) => format!("Uploaded {n} file(s)"),
-                    (Err(e), TransferKind::Download { .. }) => format!("Download failed: {e:#}"),
-                    (Err(e), TransferKind::Upload { .. }) => format!("Upload failed: {e:#}"),
+                    TransferKind::Upload { .. } => format!("Uploaded {} file(s)", out.done),
                 };
+                msg.push_str(&out.summary(plan.files.len()));
                 if skipped_existing > 0 {
                     msg.push_str(&format!(", skipped {skipped_existing} existing"));
                 }
@@ -1416,21 +1654,9 @@ impl App {
         });
     }
 
-    fn local_row_clicked(&self, index: usize, toggle: bool) {
-        let selected = {
-            let mut st = self.state.borrow_mut();
-            if index >= st.local_selected.len() {
-                return;
-            }
-            if toggle {
-                st.local_selected[index] = !st.local_selected[index];
-            } else {
-                for (i, sel) in st.local_selected.iter_mut().enumerate() {
-                    *sel = i == index;
-                }
-            }
-            st.local_selected.clone()
-        };
+    /// Shows the local selection in the rows on screen.
+    fn sync_local_selection(&self) {
+        let selected = self.state.borrow().local_selected.clone();
         for (i, sel) in selected.into_iter().enumerate() {
             if let Some(mut row) = self.local_rows.row_data(i)
                 && row.selected != sel
@@ -1439,6 +1665,38 @@ impl App {
                 self.local_rows.set_row_data(i, row);
             }
         }
+    }
+
+    fn local_row_clicked(&self, index: usize, toggle: bool) {
+        {
+            let mut st = self.state.borrow_mut();
+            if index >= st.local_selected.len() {
+                return;
+            }
+            st.local_anchor = index;
+            if toggle {
+                st.local_selected[index] = !st.local_selected[index];
+            } else {
+                for (i, sel) in st.local_selected.iter_mut().enumerate() {
+                    *sel = i == index;
+                }
+            }
+        }
+        self.sync_local_selection();
+    }
+
+    /// Shift+click: selects the rows from the last clicked one to `index`.
+    fn local_row_range(&self, index: usize) {
+        {
+            let mut st = self.state.borrow_mut();
+            if index >= st.local_selected.len() {
+                return;
+            }
+            let anchor = st.local_anchor.min(st.local_selected.len() - 1);
+            st.local_selected.fill(false);
+            st.local_selected[anchor.min(index)..=anchor.max(index)].fill(true);
+        }
+        self.sync_local_selection();
     }
 
     /// Press without Ctrl: keeps a selection that contains the row.
@@ -1519,7 +1777,52 @@ impl App {
         };
         let key = format!("{prefix}{name}/");
         self.rt.spawn(async move {
-            let result = s3::create_folder(&client, &bucket, &key).await;
+            let result = client.create_folder(&bucket, &key).await;
+            on_ui(move |app| match result {
+                Ok(()) => app.reload_if_at(tab_id, &bucket, &prefix),
+                Err(e) => app.set_status(tab_id, format!("Error: {e:#}")),
+            });
+        });
+    }
+
+    /// The entry to rename: the only selected one, inside a bucket.
+    fn rename_target(&self) -> Option<Entry> {
+        let st = self.state.borrow();
+        let t = st.active_tab().filter(|t| t.bucket.is_some())?;
+        match &t.selected_entries()[..] {
+            [e] => Some(e.clone()),
+            _ => None,
+        }
+    }
+
+    fn ask_rename(&self) {
+        let Some(entry) = self.rename_target() else {
+            return self.notify("Select one item to rename.".into());
+        };
+        let ui = self.ui();
+        ui.set_newfolder_name(entry.name.into());
+        ui.set_renaming(true);
+        ui.set_newfolder_open(true);
+    }
+
+    fn rename(&self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || name.contains('/') {
+            return self.notify("Name must not be empty or contain \"/\".".into());
+        }
+        let Some(entry) = self.rename_target() else {
+            return;
+        };
+        let Some((tab_id, client, bucket, prefix)) = self.active_target() else {
+            return;
+        };
+        if name == entry.name {
+            return;
+        }
+        let to = format!("{prefix}{name}{}", if entry.is_dir { "/" } else { "" });
+        self.set_status(tab_id, format!("Renaming {}…", entry.name));
+        self.rt.spawn(async move {
+            let result = client.rename(&bucket, &entry.key, &to).await;
             on_ui(move |app| match result {
                 Ok(()) => app.reload_if_at(tab_id, &bucket, &prefix),
                 Err(e) => app.set_status(tab_id, format!("Error: {e:#}")),
@@ -1528,7 +1831,7 @@ impl App {
     }
 
     fn ask_delete_selected(&self) {
-        let Some((tab_id, _, bucket, prefix)) = self.active_target() else {
+        let Some((tab_id, client, bucket, prefix)) = self.active_target() else {
             return;
         };
         let items = self
@@ -1542,8 +1845,9 @@ impl App {
         }
         let folders = items.iter().filter(|e| e.is_dir).count();
         let mut text = format!(
-            "Delete {} item(s) from s3://{bucket}/{prefix}?",
-            items.len()
+            "Delete {} item(s) from {}?",
+            items.len(),
+            client.uri(&bucket, &prefix)
         );
         if folders > 0 {
             text.push_str(&format!(
@@ -1556,15 +1860,36 @@ impl App {
             bucket,
             items,
         });
+        self.open_confirm("Confirm delete", "Delete", text);
+    }
+
+    /// Shows the confirm dialog. The question it answers is in `pending`.
+    fn open_confirm(&self, title: &str, action: &str, text: String) {
         let ui = self.ui();
+        ui.set_confirm_title(title.into());
+        ui.set_confirm_action(action.into());
         ui.set_confirm_text(text.into());
         ui.set_confirm_open(true);
+    }
+
+    /// Stops every running transfer.
+    fn cancel_transfers(&self) {
+        CANCEL.send_modify(|n| *n += 1);
+    }
+
+    /// Cancel in the confirm dialog. Dropping a host key question refuses
+    /// the host.
+    fn confirm_rejected(&self) {
+        self.state.borrow_mut().pending = None;
     }
 
     fn confirm_accepted(&self) {
         let pending = self.state.borrow_mut().pending.take();
         match pending {
             None => {}
+            Some(Pending::TrustHost(answer)) => {
+                let _ = answer.send(true);
+            }
             Some(Pending::DeleteServer(index)) => {
                 let saved = {
                     let mut st = self.state.borrow_mut();
@@ -1613,6 +1938,19 @@ impl App {
     }
 }
 
+/// Installed as [`sftp::CONFIRM_HOST`]: shows the question in the confirm
+/// dialog. Called from the connecting task.
+fn confirm_host(question: String) -> tokio::sync::oneshot::Receiver<bool> {
+    let (answer, asked) = tokio::sync::oneshot::channel();
+    on_ui(move |app| {
+        // Replaces a question that was still open, which then counts as
+        // answered no.
+        app.state.borrow_mut().pending = Some(Pending::TrustHost(answer));
+        app.open_confirm("Unknown SSH host", "Trust", question);
+    });
+    asked
+}
+
 fn file_row(e: &Entry, in_bucket: bool, selected: bool) -> FileEntry {
     FileEntry {
         name: e.name.as_str().into(),
@@ -1625,6 +1963,31 @@ fn file_row(e: &Entry, in_bucket: bool, selected: bool) -> FileEntry {
         },
         modified: e.modified.map(format_time).unwrap_or_default().into(),
         selected,
+    }
+}
+
+/// What a typed location means: the bucket (`None` for the bucket list) and
+/// the folder prefix. Takes `s3://bucket/folder`, `bucket/folder`,
+/// `sftp://host/folder` or a plain `/folder`; SFTP and FTP have no bucket.
+fn parse_location(text: &str, s3: bool) -> (Option<String>, String) {
+    let path = match text.trim().split_once("://") {
+        Some((_, rest)) if s3 => rest,
+        // Drops the host.
+        Some((_, rest)) => rest.split_once('/').map_or("", |(_, path)| path),
+        None => text,
+    };
+    let path = path.trim().trim_matches('/');
+    let folder = |p: &str| match p.trim_matches('/') {
+        "" => String::new(),
+        p => format!("{p}/"),
+    };
+    if !s3 {
+        return (Some(String::new()), folder(path));
+    }
+    match path.split_once('/') {
+        Some((bucket, rest)) => (Some(bucket.to_string()), folder(rest)),
+        None if path.is_empty() => (None, String::new()),
+        None => (Some(path.to_string()), String::new()),
     }
 }
 
@@ -1706,7 +2069,7 @@ fn collect_uploads(paths: &[PathBuf], prefix: &str) -> Result<Vec<(PathBuf, Stri
 /// which objects already exist.
 async fn plan_upload(
     tab_id: u64,
-    client: Client,
+    client: Remote,
     bucket: String,
     prefix: String,
     paths: Vec<PathBuf>,
@@ -1730,9 +2093,9 @@ async fn plan_upload(
     let mut existing = std::collections::HashSet::new();
     for (key, is_dir) in tops {
         if is_dir {
-            let under = s3::list_all(&client, &bucket, &format!("{key}/")).await?;
+            let under = client.list_all(&bucket, &format!("{key}/")).await?;
             existing.extend(under.into_iter().map(|(k, _)| k));
-        } else if s3::object_exists(&client, &bucket, &key).await? {
+        } else if client.object_exists(&bucket, &key).await? {
             existing.insert(key);
         }
     }
@@ -1759,7 +2122,7 @@ async fn plan_upload(
 /// which local files already exist.
 async fn plan_download(
     tab_id: u64,
-    client: Client,
+    client: Remote,
     bucket: String,
     items: &[Entry],
     dest: PathBuf,
@@ -1771,7 +2134,7 @@ async fn plan_download(
             found.push((item.key.clone(), item.name.clone(), item.size));
             continue;
         }
-        for (key, size) in s3::list_all(&client, &bucket, &item.key).await? {
+        for (key, size) in client.list_all(&bucket, &item.key).await? {
             // Folder marker objects have nothing to download.
             if key.ends_with('/') {
                 continue;
@@ -1818,7 +2181,7 @@ async fn load_preview(
             client,
             bucket,
             key,
-        } => s3::get_bytes(&client, &bucket, &key).await?,
+        } => client.get_bytes(&bucket, &key).await?,
         PreviewSource::Local(path) => tokio::fs::read(&path).await?,
     };
     tokio::task::spawn_blocking(move || {
@@ -1840,12 +2203,13 @@ async fn load_preview(
     .await?
 }
 
-async fn delete_items(client: &Client, bucket: &str, items: &[Entry]) -> Result<usize> {
+async fn delete_items(client: &Remote, bucket: &str, items: &[Entry]) -> Result<usize> {
     let mut keys = Vec::new();
     for item in items {
         if item.is_dir {
             keys.extend(
-                s3::list_all(client, bucket, &item.key)
+                client
+                    .list_all(bucket, &item.key)
                     .await?
                     .into_iter()
                     .map(|(k, _)| k),
@@ -1854,7 +2218,7 @@ async fn delete_items(client: &Client, bucket: &str, items: &[Entry]) -> Result<
             keys.push(item.key.clone());
         }
     }
-    s3::delete_keys(client, bucket, &keys).await?;
+    client.delete_keys(bucket, &keys).await?;
     Ok(keys.len())
 }
 
@@ -1895,8 +2259,16 @@ fn main() -> Result<()> {
     app.local_load();
 
     ui.on_connect_server(|i| with_app(|a| a.connect(i as usize)));
-    ui.on_add_server(|| with_app(|a| a.open_server_dialog(None)));
-    ui.on_edit_server(|i| with_app(|a| a.open_server_dialog(Some(i as usize))));
+    ui.on_add_server(|| with_app(|a| a.open_server_dialog(None, false)));
+    ui.on_edit_server(|i| with_app(|a| a.open_server_dialog(Some(i as usize), false)));
+    ui.on_duplicate_server(|i| with_app(|a| a.open_server_dialog(Some(i as usize), true)));
+    ui.on_browse_key_file(|| with_app(|a| a.browse_key_file()));
+    ui.on_go_to(|text| with_app(|a| a.go_to(&text)));
+    ui.on_row_range(|i| with_app(|a| a.row_range(i as usize)));
+    ui.on_local_row_range(|i| with_app(|a| a.local_row_range(i as usize)));
+    ui.on_activate_selected(|local| with_app(|a| a.activate_selected(local)));
+    ui.on_ask_rename(|| with_app(|a| a.ask_rename()));
+    ui.on_rename(|name| with_app(|a| a.rename(&name)));
     ui.on_delete_server(|i| with_app(|a| a.ask_delete_server(i as usize)));
     ui.on_save_server(|| with_app(|a| a.save_server()));
     ui.on_test_server(|| with_app(|a| a.test_server()));
@@ -1932,6 +2304,9 @@ fn main() -> Result<()> {
     ui.on_dropped(|from_local| with_app(|a| a.dropped(from_local)));
     ui.on_conflict_choice(|choice| with_app(|a| a.conflict_choice(choice)));
     ui.on_confirm_accepted(|| with_app(|a| a.confirm_accepted()));
+    ui.on_confirm_rejected(|| with_app(|a| a.confirm_rejected()));
+    ui.on_cancel_transfers(|| with_app(|a| a.cancel_transfers()));
+    let _ = sftp::CONFIRM_HOST.set(confirm_host);
 
     ui.run()?;
     APP.with(|a| a.borrow_mut().take());
@@ -2015,17 +2390,136 @@ mod tests {
         };
         let plan = Transfer {
             tab_id: 1,
-            client: s3::build_client(&ServerProfile::default()),
+            client: Remote::new(&ServerProfile::default()),
             bucket: "bkt".into(),
             kind: TransferKind::Upload {
                 prefix: "base/".into(),
             },
-            files: vec![file("a.txt", true), file("d/b.txt", true), file("c.txt", false)],
+            files: vec![
+                file("a.txt", true),
+                file("d/b.txt", true),
+                file("c.txt", false),
+            ],
             skipped_unsafe: 0,
         };
         assert_eq!(
             plan.conflict_text(),
             "2 of 3 file(s) already exist in s3://bkt/base/:\n\n  a.txt\n  d/b.txt"
+        );
+    }
+
+    /// A failed file does not stop the batch, and Cancel removes the partial
+    /// file: `FTP_TEST_HOST=… FTP_TEST_PASSWORD=… cargo test
+    /// transfer_failure_and_cancel -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs an FTP server"]
+    async fn transfer_failure_and_cancel() {
+        let env = |k| std::env::var(k).unwrap_or_default();
+        let client = Remote::new(&ServerProfile {
+            protocol: Protocol::Ftp,
+            host: env("FTP_TEST_HOST"),
+            password: env("FTP_TEST_PASSWORD"),
+            ..Default::default()
+        });
+        let base = client.start_prefix().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small.txt");
+        std::fs::write(&small, b"hello").unwrap();
+        let big = dir.path().join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(2 * 1024 * 1024 * 1024)
+            .unwrap();
+        let file = |local: &PathBuf, name: &str| TransferFile {
+            local: local.clone(),
+            key: format!("{base}{name}"),
+            size: 0,
+            exists: false,
+        };
+        let plan = |kind, files| Transfer {
+            tab_id: 1,
+            client: client.clone(),
+            bucket: String::new(),
+            kind,
+            files,
+            skipped_unsafe: 0,
+        };
+
+        // The middle file cannot be read; the ones around it still go.
+        let up = TransferKind::Upload {
+            prefix: base.clone(),
+        };
+        let files = vec![
+            file(&small, "one.txt"),
+            file(&dir.path().join("missing"), "two.txt"),
+            file(&small, "three.txt"),
+        ];
+        let out = plan(up, files).run().await;
+        assert_eq!((out.done, out.failed.len(), out.cancelled), (2, 1, false));
+        assert!(out.failed[0].contains("two.txt"), "{:?}", out.failed);
+        assert!(
+            client
+                .object_exists("", &format!("{base}three.txt"))
+                .await
+                .unwrap()
+        );
+
+        // Cancelled mid-file: the partial upload is removed, the rest is left out.
+        let up = TransferKind::Upload {
+            prefix: base.clone(),
+        };
+        let files = vec![file(&big, "big.bin"), file(&small, "after.txt")];
+        let plan = plan(up, files);
+        let (out, ()) = tokio::join!(plan.run(), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            CANCEL.send_modify(|n| *n += 1);
+        });
+        assert_eq!((out.done, out.failed.len(), out.cancelled), (0, 0, true));
+        assert_eq!(out.summary(2), ", cancelled with 2 left");
+        for name in ["big.bin", "after.txt"] {
+            assert!(
+                !client
+                    .object_exists("", &format!("{base}{name}"))
+                    .await
+                    .unwrap()
+            );
+        }
+        let keys = [format!("{base}one.txt"), format!("{base}three.txt")];
+        client.delete_keys("", &keys).await.unwrap();
+    }
+
+    #[test]
+    fn typed_locations() {
+        let s3 = |t| parse_location(t, true);
+        assert_eq!(s3("s3://"), (None, String::new()));
+        assert_eq!(s3("s3://data"), (Some("data".into()), String::new()));
+        assert_eq!(
+            s3(" data/logs//2024 "),
+            (Some("data".into()), "logs//2024/".into())
+        );
+        let ssh = |t| parse_location(t, false);
+        assert_eq!(
+            ssh("sftp://me@box:22/var/log/"),
+            (Some(String::new()), "var/log/".into())
+        );
+        assert_eq!(ssh("/var/log"), (Some(String::new()), "var/log/".into()));
+        assert_eq!(ssh("sftp://me@box"), (Some(String::new()), String::new()));
+        assert_eq!(ssh("/"), (Some(String::new()), String::new()));
+    }
+
+    #[test]
+    fn outcome_summary() {
+        let mut out = Outcome {
+            done: 3,
+            ..Default::default()
+        };
+        assert_eq!(out.summary(3), "");
+        out.failed = vec!["a.txt: denied".into(), "b.txt: denied".into()];
+        assert_eq!(out.summary(5), ", 2 failed, first: a.txt: denied");
+        out.cancelled = true;
+        assert_eq!(
+            out.summary(9),
+            ", cancelled with 4 left, 2 failed, first: a.txt: denied"
         );
     }
 

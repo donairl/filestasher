@@ -7,6 +7,27 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// How a server is reached. The numbers are the protocol list's order in the
+/// server dialog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    S3 = 0,
+    Sftp = 1,
+    Ftp = 2,
+}
+
+impl Protocol {
+    pub fn from_index(index: i32) -> Protocol {
+        match index {
+            1 => Protocol::Sftp,
+            2 => Protocol::Ftp,
+            _ => Protocol::S3,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerProfile {
     pub name: String,
@@ -21,9 +42,29 @@ pub struct ServerProfile {
     pub secret_key: String,
     #[serde(default)]
     pub path_style: bool,
-    /// Optional bucket to open directly on connect.
+    /// Optional bucket to open directly on connect. For SFTP and FTP: the
+    /// start folder, blank for the home folder.
     #[serde(default)]
     pub bucket: String,
+    #[serde(default)]
+    pub protocol: Protocol,
+    /// SFTP and FTP: `[user@]host[:port]`.
+    #[serde(default)]
+    pub host: String,
+    /// SFTP and FTP: login password. For SFTP also the passphrase of the key
+    /// file.
+    #[serde(default)]
+    pub password: String,
+    /// SFTP: private key; blank tries the default keys in `~/.ssh`.
+    #[serde(default)]
+    pub key_file: String,
+    /// SFTP: jump hosts to tunnel through, comma separated, each
+    /// `[user@]host[:port]`. Blank connects directly.
+    #[serde(default)]
+    pub jump: String,
+    /// Blank uses `password` on the jump hosts too.
+    #[serde(default)]
+    pub jump_password: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -90,6 +131,14 @@ mod tests {
                     secret_key: "s3cr3t/+=".into(),
                     path_style: true,
                     bucket: "data".into(),
+                    ..Default::default()
+                },
+                ServerProfile {
+                    name: "box".into(),
+                    protocol: Protocol::Sftp,
+                    host: "me@10.0.0.5:2222".into(),
+                    jump: "ops@bastion".into(),
+                    ..Default::default()
                 },
                 ServerProfile {
                     name: "aws".into(),
@@ -126,6 +175,10 @@ mod tests {
         let cfg: Config = toml::from_str("[[servers]]\nname = \"x\"\n").unwrap();
         assert_eq!(cfg.servers[0].name, "x");
         assert!(!cfg.servers[0].path_style);
+        assert_eq!(cfg.servers[0].protocol, Protocol::S3);
+        let cfg: Config =
+            toml::from_str("[[servers]]\nname = \"x\"\nprotocol = \"ftp\"\n").unwrap();
+        assert_eq!(cfg.servers[0].protocol, Protocol::Ftp);
     }
 
     #[cfg(unix)]
