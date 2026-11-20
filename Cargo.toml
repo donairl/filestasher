@@ -4,8 +4,10 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
+aes-gcm = { version = "0.11", features = ["getrandom"] }
 anyhow = "1.0.104"
 aws-sdk-s3 = { version = "1.161.0", features = ["behavior-version-latest"] }
+base64 = "0.23.1"
 chrono = "0.4.45"
 dirs = "7.0.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "ico"] }

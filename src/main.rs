@@ -2232,7 +2232,15 @@ fn main() -> Result<()> {
     match config::config_path() {
         Ok(path) => {
             match Config::load_from(&path) {
-                Ok(cfg) => state.config = cfg,
+                Ok(cfg) => {
+                    if cfg.has_locked_secrets() {
+                        state.global_status = "Some saved passwords cannot be decrypted \
+                            (servers.key is missing or changed). Edit those servers and \
+                            enter the passwords again."
+                            .into();
+                    }
+                    state.config = cfg;
+                }
                 Err(e) => state.global_status = format!("Config error: {e:#}"),
             }
             state.config_path = path;

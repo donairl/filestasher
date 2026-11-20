@@ -144,10 +144,20 @@ host = "backup@192.168.1.20"
 password = "..."
 ```
 
-> **Security:** secret keys and SSH and FTP passwords are stored in plaintext. Anyone who can read this
-> file gets full access to those servers. On Unix the file is created with mode
-> `0600`, which only protects it from other users on the same machine. Do not
-> commit or share this file.
+Secret keys and passwords are written encrypted (AES-256-GCM); in the file
+they look like `secret_key = "enc:v1:…"`. The key is `servers.key` in the same
+folder, made on the first save. A value typed in by hand as plain text is
+accepted and encrypted the next time the application starts.
+
+To move profiles to another computer, copy both `servers.toml` and
+`servers.key`. Without the key file the passwords cannot be read and have to
+be entered again.
+
+> **Security:** the encryption keeps passwords out of sight and out of a
+> `servers.toml` that is shared or backed up on its own. It does not protect
+> against someone who can read the whole folder: with `servers.key` they can
+> decrypt everything. On Unix both files are created with mode `0600`. Do not
+> commit or share `servers.key`.
 
 ## Behaviour notes
 
