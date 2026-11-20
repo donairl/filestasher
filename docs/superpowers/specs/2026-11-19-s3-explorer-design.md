@@ -1,4 +1,4 @@
-# S3 FStasher — design
+# Filestasher — design
 
 Desktop S3 file explorer written in Rust with a Slint UI.
 
@@ -31,7 +31,7 @@ navigation discards stale results.
 
 ## Server profiles
 
-Stored in `~/.config/s3-fstasher/servers.toml`, written with mode `0600`.
+Stored in `~/.config/filestasher/servers.toml`, written with mode `0600`.
 Fields: name, endpoint URL (blank means AWS), region, access key, secret key,
 path-style flag, optional default bucket.
 

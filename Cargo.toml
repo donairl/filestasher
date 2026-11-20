@@ -1,6 +1,6 @@
 [package]
-name = "s3-fstasher"
-version = "0.2.0"
+name = "filestasher"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]

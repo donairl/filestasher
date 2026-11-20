@@ -2060,6 +2060,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "filestasher"
+version = "0.3.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "aws-sdk-s3",
+ "base64",
+ "chrono",
+ "dirs",
+ "image",
+ "rfd",
+ "russh",
+ "russh-sftp",
+ "serde",
+ "slint",
+ "slint-build",
+ "suppaftp",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "filetime"
 version = "0.2.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5651,29 +5674,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "s3-fstasher"
-version = "0.2.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "aws-sdk-s3",
- "base64",
- "chrono",
- "dirs",
- "image",
- "rfd",
- "russh",
- "russh-sftp",
- "serde",
- "slint",
- "slint-build",
- "suppaftp",
- "tempfile",
- "tokio",
- "toml",
-]
 
 [[package]]
 name = "salsa20"

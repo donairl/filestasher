@@ -1,4 +1,4 @@
-//! S3 FStasher: an S3 file explorer.
+//! Filestasher: a file explorer for S3, SFTP and FTP servers.
 //!
 //! All state lives on the UI thread in [`App`]. S3 work runs on a tokio
 //! runtime and reports back through [`on_ui`].

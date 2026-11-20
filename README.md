@@ -1,4 +1,4 @@
-# S3 FStasher
+# Filestasher
 
 A desktop file explorer for S3 and S3-compatible storage (AWS S3, MinIO, Ceph,
 Cloudflare R2, Wasabi, and others), for SFTP servers over SSH, directly or
@@ -50,7 +50,7 @@ and drop from other applications, creating or deleting buckets.
 cargo run --release
 ```
 
-The binary is written to `target/release/s3-fstasher`.
+The binary is written to `target/release/filestasher`.
 
 ## Usage
 
@@ -114,11 +114,11 @@ Choose **FTP** as the protocol.
 
 Profiles are stored in `servers.toml` inside the user configuration directory:
 
-| Platform | Path                                                      |
-| -------- | --------------------------------------------------------- |
-| Linux    | `~/.config/s3-fstasher/servers.toml`                      |
-| macOS    | `~/Library/Application Support/s3-fstasher/servers.toml`  |
-| Windows  | `%APPDATA%\s3-fstasher\servers.toml`                      |
+| Platform | Path                                                     |
+| -------- | -------------------------------------------------------- |
+| Linux    | `~/.config/filestasher/servers.toml`                     |
+| macOS    | `~/Library/Application Support/filestasher/servers.toml` |
+| Windows  | `%APPDATA%\filestasher\servers.toml`                     |
 
 ```toml
 [[servers]]
@@ -217,8 +217,8 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release gets `s3-fstasher-<tag>-linux-x86_64.tar.gz` and
-`s3-fstasher-<tag>-windows-x86_64.zip`. Keep the tag in step with `version` in
+The release gets `filestasher-<tag>-linux-x86_64.tar.gz` and
+`filestasher-<tag>-windows-x86_64.zip`. Keep the tag in step with `version` in
 `Cargo.toml`.
 
 ## Tests

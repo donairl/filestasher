@@ -155,7 +155,13 @@ pub struct Config {
 
 pub fn config_path() -> Result<PathBuf> {
     let dir = dirs::config_dir().context("cannot find the user config directory")?;
-    Ok(dir.join("s3-fstasher").join("servers.toml"))
+    let new = dir.join("filestasher");
+    // The app used to be called s3-fstasher: take its settings along.
+    let old = dir.join("s3-fstasher");
+    if !new.exists() && old.exists() {
+        let _ = std::fs::rename(&old, &new);
+    }
+    Ok(new.join("servers.toml"))
 }
 
 impl Config {

@@ -61,7 +61,7 @@ pub fn build_client(p: &ServerProfile) -> Client {
             p.secret_key.trim(),
             None,
             None,
-            "s3-fstasher",
+            "filestasher",
         ))
         .force_path_style(p.path_style)
         // Many S3-compatible servers reject the newer default checksums.

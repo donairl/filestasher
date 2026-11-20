@@ -45,10 +45,10 @@ jobs:
         include:
           - name: linux-x86_64
             os: ubuntu-24.04
-            binary: s3-fstasher
+            binary: filestasher
           - name: windows-x86_64
             os: windows-latest
-            binary: s3-fstasher.exe
+            binary: filestasher.exe
     env:
       # Lets the TLS backend build on Windows without NASM installed.
       AWS_LC_SYS_PREBUILT_NASM: "1"
@@ -78,7 +78,7 @@ jobs:
       - name: Package
         id: package
         run: |
-          dir="s3-fstasher-$TAG-${{ matrix.name }}"
+          dir="filestasher-$TAG-${{ matrix.name }}"
           mkdir "$dir"
           cp "target/release/${{ matrix.binary }}" README.md "$dir/"
           if [ "$RUNNER_OS" = "Windows" ]; then
