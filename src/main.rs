@@ -2502,6 +2502,15 @@ fn main() -> Result<()> {
     ui.on_editor_save(|close_after| with_app(|a| a.editor_save(close_after)));
     ui.on_editor_close(|| with_app(|a| a.editor_close()));
     ui.on_editor_discard(|| with_app(|a| a.editor_discard()));
+    ui.on_editor_find(|text, needle, from, forward| {
+        match editor::find(&text, &needle, from.max(0) as usize, forward) {
+            Some((start, end)) => FindRange {
+                start: start as i32,
+                end: end as i32,
+            },
+            None => FindRange { start: -1, end: -1 },
+        }
+    });
     ui.on_go_to(|text| with_app(|a| a.go_to(&text)));
     ui.on_row_range(|i| with_app(|a| a.row_range(i as usize)));
     ui.on_local_row_range(|i| with_app(|a| a.local_row_range(i as usize)));

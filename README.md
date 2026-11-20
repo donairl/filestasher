@@ -21,7 +21,8 @@ through jump hosts, and for FTP servers, written in Rust with a
 - Download files and whole folders.
 - Image preview: double-click a PNG, JPEG, GIF, BMP, WebP or ICO file.
 - Text editor: double-click a text file, on the server or in the local pane,
-  to edit it in a pop-up with line numbers. Ctrl+S saves, Esc closes.
+  to edit it in a pop-up with line numbers. Ctrl+S saves, Ctrl+F finds text (F3 next, Shift+F3
+  previous), Esc closes.
 - Right-click menu on the file list: open, preview, download, copy the path or
   the `s3://` URI to the clipboard.
 - Local folder pane on the right, with sortable columns, image preview and a

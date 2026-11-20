@@ -141,6 +141,30 @@ pub fn line_numbers(count: usize) -> String {
     numbers.join("\n")
 }
 
+/// The next match of `needle`, as byte offsets `(start, end)`: after `from`
+/// when going forward, before it when going backward, wrapping around at the
+/// ends. Case is ignored.
+pub fn find(text: &str, needle: &str, from: usize, forward: bool) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    // ponytail: ASCII-only case folding, so offsets stay those of `text`;
+    // full Unicode folding needs an offset map.
+    let hay = text.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let start = if forward {
+        hay.get(from..)
+            .and_then(|rest| rest.find(&needle))
+            .map(|i| i + from)
+            .or_else(|| hay.find(&needle))
+    } else {
+        hay.get(..from)
+            .and_then(|before| before.rfind(&needle))
+            .or_else(|| hay.rfind(&needle))
+    }?;
+    Some((start, start + needle.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +216,24 @@ mod tests {
                 .unwrap_err()
                 .contains("larger than 2 MB")
         );
+    }
+
+    #[test]
+    fn finding() {
+        let text = "Satu dua\nsatu é dua";
+        assert_eq!(find(text, "satu", 0, true), Some((0, 4)));
+        assert_eq!(find(text, "SATU", 4, true), Some((9, 13)));
+        // Wraps around at both ends.
+        assert_eq!(find(text, "satu", 13, true), Some((0, 4)));
+        assert_eq!(find(text, "satu", 0, false), Some((9, 13)));
+        assert_eq!(find(text, "dua", 17, false), Some((5, 8)));
+        // Offsets are bytes: é is two.
+        assert_eq!(find(text, "dua", 9, true), Some((17, 20)));
+        assert_eq!(find(text, "tiga", 0, true), None);
+        assert_eq!(find(text, "", 0, true), None);
+        // A start beyond the text or inside a character still finds.
+        assert_eq!(find(text, "dua", 99, true), Some((5, 8)));
+        assert_eq!(find(text, "dua", 15, true), Some((5, 8)));
     }
 
     #[test]

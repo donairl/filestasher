@@ -5,6 +5,12 @@ export struct ServerItem {
     endpoint: string,
 }
 
+// A match in the editor, in byte offsets; start is -1 when there is none.
+export struct FindRange {
+    start: int,
+    end: int,
+}
+
 export struct FileEntry {
     name: string,
     is-dir: bool,
@@ -384,6 +390,8 @@ export component MainWindow inherits Window {
     callback editor-save(bool);
     callback editor-close();
     callback editor-discard();
+    // Text, what to look for, where to start, forward or backward.
+    callback editor-find(string, string, int, bool) -> FindRange;
 
     // New folder dialog
     in-out property <bool> newfolder-open;
@@ -1463,6 +1471,26 @@ export component MainWindow inherits Window {
         // Swallows clicks so the window behind is inert.
         TouchArea { }
 
+        property <bool> find-missing;
+        // Selects the next or previous match, starting at the selection.
+        function find(forward: bool, from: int) {
+            if (find-input.text == "") {
+                self.find-missing = false;
+                return;
+            }
+            let hit = root.editor-find(root.editor-text, find-input.text, from, forward);
+            self.find-missing = hit.start < 0;
+            if (hit.start >= 0) {
+                editor-input.set-selection-offsets(hit.start, hit.end);
+            }
+        }
+        function find-next() {
+            find(true, max(editor-input.anchor-position-byte-offset, editor-input.cursor-position-byte-offset));
+        }
+        function find-previous() {
+            find(false, min(editor-input.anchor-position-byte-offset, editor-input.cursor-position-byte-offset));
+        }
+
         Rectangle {
             x: 24px;
             y: 24px;
@@ -1492,6 +1520,49 @@ export component MainWindow inherits Window {
                             font-size: 11px;
                             opacity: 0.7;
                             overflow: elide;
+                        }
+                    }
+
+                    find-input := LineEdit {
+                        width: 200px;
+                        placeholder-text: "Find";
+                        // Finds as you type, from the start of the selection.
+                        edited => {
+                            find(true, min(editor-input.anchor-position-byte-offset, editor-input.cursor-position-byte-offset));
+                        }
+                        accepted => {
+                            find-next();
+                        }
+                        key-pressed(ev) => {
+                            if (ev.text == Key.Escape) {
+                                editor-input.focus();
+                                return accept;
+                            }
+                            if (ev.text == Key.F3 || ev.text == Key.Return) {
+                                if (ev.modifiers.shift) {
+                                    find-previous();
+                                } else {
+                                    find-next();
+                                }
+                                return accept;
+                            }
+                            return reject;
+                        }
+                    }
+
+                    Button {
+                        text: "↑";
+                        enabled: find-input.text != "";
+                        clicked => {
+                            find-previous();
+                        }
+                    }
+
+                    Button {
+                        text: "↓";
+                        enabled: find-input.text != "";
+                        clicked => {
+                            find-next();
                         }
                     }
 
@@ -1573,6 +1644,19 @@ export component MainWindow inherits Window {
                                         root.editor-save(false);
                                         return accept;
                                     }
+                                    if (ev.modifiers.control && ev.text == "f") {
+                                        find-input.focus();
+                                        find-input.select-all();
+                                        return accept;
+                                    }
+                                    if (ev.text == Key.F3) {
+                                        if (ev.modifiers.shift) {
+                                            find-previous();
+                                        } else {
+                                            find-next();
+                                        }
+                                        return accept;
+                                    }
                                     if (ev.text == Key.Escape) {
                                         root.editor-close();
                                         return accept;
@@ -1598,7 +1682,7 @@ export component MainWindow inherits Window {
                 }
 
                 Text {
-                    text: root.editor-message != "" ? root.editor-message : "Ctrl+S save · Esc close";
+                    text: find-missing ? "Not found: " + find-input.text : root.editor-message != "" ? root.editor-message : "Ctrl+S save · Ctrl+F find · F3 next · Shift+F3 previous · Esc close";
                     font-size: 11px;
                     opacity: 0.8;
                     overflow: elide;
