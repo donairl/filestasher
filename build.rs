@@ -1,3 +1,7 @@
 fn main() {
-    slint_build::compile("ui/app.slint").expect("failed to compile ui/app.slint");
+    slint_build::compile_with_config(
+        "ui/app.slint",
+        slint_build::CompilerConfiguration::new().with_style("cosmic".into()),
+    )
+    .expect("failed to compile ui/app.slint");
 }
