@@ -7,6 +7,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod config;
+mod editor;
 mod ftp;
 mod remote;
 mod s3;
@@ -246,6 +247,8 @@ static CANCEL: LazyLock<tokio::sync::watch::Sender<u64>> =
     LazyLock::new(|| tokio::sync::watch::channel(0).0);
 
 /// Where a previewed image comes from.
+/// A file that is previewed or edited.
+#[derive(Clone)]
 enum PreviewSource {
     Remote {
         client: Remote,
@@ -255,7 +258,25 @@ enum PreviewSource {
     Local(PathBuf),
 }
 
+/// The text file open in the editor.
+struct Editor {
+    name: String,
+    source: PreviewSource,
+    /// The file's bytes when it was opened or last saved, to notice a file
+    /// that changed underneath.
+    original: Vec<u8>,
+    /// The text that matches `original`.
+    saved: String,
+    crlf: bool,
+    lines: usize,
+    read_only: bool,
+}
+
 enum Pending {
+    /// Overwrite the edited file; then close the editor or keep it open.
+    SaveEdit {
+        close_after: bool,
+    },
     /// An SSH host seen for the first time; the answer goes to the
     /// connection that waits for it. Dropping it answers no.
     TrustHost(tokio::sync::oneshot::Sender<bool>),
@@ -301,6 +322,7 @@ struct State {
     /// Row clicked last in each list, where a Shift+click range starts.
     anchor: usize,
     local_anchor: usize,
+    editor: Option<Editor>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1358,6 +1380,167 @@ impl App {
         });
     }
 
+    // ---- Text editor ----------------------------------------------------
+
+    /// Opens a text file in the editor. Anything else is refused with a
+    /// message in the status bar.
+    fn open_editor(&self, name: String, size: u64, source: PreviewSource) {
+        if size > editor::MAX_BYTES {
+            return self.notify(format!(
+                "{name} is larger than 2 MB and cannot be opened in the editor."
+            ));
+        }
+        self.notify(format!("Opening {name}…"));
+        self.rt.spawn(async move {
+            let bytes = read_source(&source).await;
+            let read_only = match &source {
+                // Opening for writing changes nothing and answers the question.
+                PreviewSource::Local(path) => {
+                    std::fs::OpenOptions::new().write(true).open(path).is_err()
+                }
+                // ponytail: a server only says so when the save fails.
+                PreviewSource::Remote { .. } => false,
+            };
+            on_ui(move |app| {
+                let bytes = match bytes {
+                    Ok(bytes) => bytes,
+                    Err(e) => return app.notify(format!("Cannot open {name}: {e:#}")),
+                };
+                let doc = match editor::decode(&name, bytes.clone()) {
+                    Ok(doc) => doc,
+                    Err(why) => return app.notify(format!("{name} {why}")),
+                };
+                let path = match &source {
+                    PreviewSource::Local(path) => path.display().to_string(),
+                    PreviewSource::Remote {
+                        client,
+                        bucket,
+                        key,
+                    } => client.uri(bucket, key),
+                };
+                let lines = editor::line_count(&doc.text);
+                let ui = app.ui();
+                ui.set_editor_name(name.as_str().into());
+                ui.set_editor_path(path.into());
+                ui.set_editor_text(doc.text.as_str().into());
+                ui.set_editor_lines(editor::line_numbers(lines).into());
+                ui.set_editor_dirty(false);
+                ui.set_editor_read_only(read_only);
+                ui.set_editor_message(if read_only { "Read only" } else { "" }.into());
+                app.state.borrow_mut().editor = Some(Editor {
+                    name: name.clone(),
+                    source,
+                    original: bytes,
+                    saved: doc.text,
+                    crlf: doc.crlf,
+                    lines,
+                    read_only,
+                });
+                app.notify(format!("Opened {name}."));
+                ui.set_editor_open(true);
+            });
+        });
+    }
+
+    fn editor_edited(&self, text: &str) {
+        let ui = self.ui();
+        let mut st = self.state.borrow_mut();
+        let Some(ed) = st.editor.as_mut() else { return };
+        ui.set_editor_dirty(text != ed.saved);
+        let lines = editor::line_count(text);
+        if lines != ed.lines {
+            ed.lines = lines;
+            ui.set_editor_lines(editor::line_numbers(lines).into());
+        }
+    }
+
+    /// Save was asked for: checks whether the file changed underneath, then
+    /// asks before overwriting it.
+    fn editor_save(&self, close_after: bool) {
+        let (name, source, original) = {
+            let st = self.state.borrow();
+            match &st.editor {
+                Some(ed) if !ed.read_only => {
+                    (ed.name.clone(), ed.source.clone(), ed.original.clone())
+                }
+                _ => return,
+            }
+        };
+        self.rt.spawn(async move {
+            let warning = match read_source(&source).await {
+                Ok(now) if now == original => String::new(),
+                Ok(_) => "\n\nWarning: the file has changed since it was opened. \
+                          Overwriting discards those changes."
+                    .to_string(),
+                Err(e) => format!("\n\nWarning: the file can no longer be read ({e:#})."),
+            };
+            on_ui(move |app| {
+                app.state.borrow_mut().pending = Some(Pending::SaveEdit { close_after });
+                app.open_confirm(
+                    "Overwrite file",
+                    "Overwrite",
+                    format!("Overwrite {name}?{warning}"),
+                );
+            });
+        });
+    }
+
+    /// The overwrite was confirmed.
+    fn editor_write(&self, close_after: bool) {
+        let ui = self.ui();
+        let text = ui.get_editor_text().to_string();
+        let (source, bytes) = {
+            let st = self.state.borrow();
+            let Some(ed) = &st.editor else { return };
+            (ed.source.clone(), editor::encode(&text, ed.crlf))
+        };
+        ui.set_editor_message("Saving…".into());
+        self.rt.spawn(async move {
+            let result = write_source(&source, &bytes).await;
+            on_ui(move |app| {
+                let ui = app.ui();
+                if let Err(e) = result {
+                    // The editor stays open, so nothing typed is lost.
+                    return ui.set_editor_message(format!("Save failed: {e:#}").into());
+                }
+                {
+                    let mut st = app.state.borrow_mut();
+                    let Some(ed) = st.editor.as_mut() else { return };
+                    ui.set_editor_dirty(ui.get_editor_text() != text.as_str());
+                    ed.original = bytes;
+                    ed.saved = text;
+                }
+                ui.set_editor_message("Saved".into());
+                // The listing shows the new size and time.
+                match source {
+                    PreviewSource::Local(_) => app.local_load(),
+                    PreviewSource::Remote { .. } => app.refresh(),
+                }
+                if close_after {
+                    app.editor_discard();
+                }
+            });
+        });
+    }
+
+    /// Close was asked for: unsaved changes get a question first.
+    fn editor_close(&self) {
+        let ui = self.ui();
+        if ui.get_editor_dirty() {
+            ui.set_editor_close_open(true);
+        } else {
+            self.editor_discard();
+        }
+    }
+
+    /// Closes the editor without saving.
+    fn editor_discard(&self) {
+        self.state.borrow_mut().editor = None;
+        let ui = self.ui();
+        ui.set_editor_open(false);
+        ui.set_editor_text(SharedString::new());
+    }
+
     fn row_activated(&self, row: usize) {
         let Some(index) = self.entry_index(row) else {
             return;
@@ -1369,23 +1552,22 @@ impl App {
                 return;
             };
             if !entry.is_dir {
-                let target = match &t.bucket {
-                    Some(b) if is_image(&entry.name) => {
-                        Some((t.client.clone(), b.clone(), entry.clone()))
-                    }
-                    _ => None,
-                };
+                let target = t
+                    .bucket
+                    .as_ref()
+                    .map(|b| (t.client.clone(), b.clone(), entry.clone()));
                 drop(st);
                 if let Some((client, bucket, entry)) = target {
-                    self.preview(
-                        entry.name,
-                        entry.size,
-                        PreviewSource::Remote {
-                            client,
-                            bucket,
-                            key: entry.key,
-                        },
-                    );
+                    let source = PreviewSource::Remote {
+                        client,
+                        bucket,
+                        key: entry.key,
+                    };
+                    if is_image(&entry.name) {
+                        self.preview(entry.name, entry.size, source);
+                    } else {
+                        self.open_editor(entry.name, entry.size, source);
+                    }
                 }
                 return;
             }
@@ -1715,6 +1897,8 @@ impl App {
             self.local_open_dir(entry.path);
         } else if is_image(&entry.name) {
             self.preview(entry.name, entry.size, PreviewSource::Local(entry.path));
+        } else {
+            self.open_editor(entry.name, entry.size, PreviewSource::Local(entry.path));
         }
     }
 
@@ -1890,6 +2074,7 @@ impl App {
             Some(Pending::TrustHost(answer)) => {
                 let _ = answer.send(true);
             }
+            Some(Pending::SaveEdit { close_after }) => self.editor_write(close_after),
             Some(Pending::DeleteServer(index)) => {
                 let saved = {
                     let mut st = self.state.borrow_mut();
@@ -2173,17 +2358,58 @@ async fn plan_download(
 
 /// Reads and decodes an image. Returns the pixels and the original size;
 /// large images are scaled down to [`MAX_PREVIEW_SIDE`].
-async fn load_preview(
-    source: PreviewSource,
-) -> Result<(slint::SharedPixelBuffer<slint::Rgba8Pixel>, u32, u32)> {
-    let bytes = match source {
+/// A monospace font for the editor. The toolkit wants a real family name,
+/// so on Linux fontconfig is asked which one "monospace" means.
+// ponytail: fixed names elsewhere; make it a setting if someone asks.
+fn monospace_font() -> String {
+    if cfg!(windows) {
+        return "Consolas".into();
+    }
+    if cfg!(target_os = "macos") {
+        return "Menlo".into();
+    }
+    std::process::Command::new("fc-match")
+        .args(["-f", "%{family[0]}", "monospace"])
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .filter(|family| !family.trim().is_empty())
+        .unwrap_or_else(|| "DejaVu Sans Mono".into())
+}
+
+async fn read_source(source: &PreviewSource) -> Result<Vec<u8>> {
+    Ok(match source {
         PreviewSource::Remote {
             client,
             bucket,
             key,
-        } => client.get_bytes(&bucket, &key).await?,
-        PreviewSource::Local(path) => tokio::fs::read(&path).await?,
-    };
+        } => client.get_bytes(bucket, key).await?,
+        PreviewSource::Local(path) => tokio::fs::read(path).await?,
+    })
+}
+
+/// Overwrites the file with `bytes`.
+async fn write_source(source: &PreviewSource, bytes: &[u8]) -> Result<()> {
+    match source {
+        PreviewSource::Local(path) => Ok(tokio::fs::write(path, bytes).await?),
+        // Uploads go from a file, so the text takes a detour through one
+        // that only this user can read.
+        PreviewSource::Remote {
+            client,
+            bucket,
+            key,
+        } => {
+            let tmp = tempfile::NamedTempFile::new()?;
+            tokio::fs::write(tmp.path(), bytes).await?;
+            client.upload_file(bucket, key, tmp.path(), &|_| {}).await
+        }
+    }
+}
+
+async fn load_preview(
+    source: PreviewSource,
+) -> Result<(slint::SharedPixelBuffer<slint::Rgba8Pixel>, u32, u32)> {
+    let bytes = read_source(&source).await?;
     tokio::task::spawn_blocking(move || {
         let img = image::load_from_memory(&bytes)?;
         let (width, height) = (img.width(), img.height());
@@ -2249,6 +2475,7 @@ fn main() -> Result<()> {
     }
 
     let entries = Rc::new(VecModel::<FileEntry>::default());
+    ui.set_editor_font(monospace_font().into());
     ui.set_entries(ModelRc::from(entries.clone()));
     let local_rows = Rc::new(VecModel::<FileEntry>::default());
     ui.set_local_entries(ModelRc::from(local_rows.clone()));
@@ -2271,6 +2498,10 @@ fn main() -> Result<()> {
     ui.on_edit_server(|i| with_app(|a| a.open_server_dialog(Some(i as usize), false)));
     ui.on_duplicate_server(|i| with_app(|a| a.open_server_dialog(Some(i as usize), true)));
     ui.on_browse_key_file(|| with_app(|a| a.browse_key_file()));
+    ui.on_editor_edited(|text| with_app(|a| a.editor_edited(&text)));
+    ui.on_editor_save(|close_after| with_app(|a| a.editor_save(close_after)));
+    ui.on_editor_close(|| with_app(|a| a.editor_close()));
+    ui.on_editor_discard(|| with_app(|a| a.editor_discard()));
     ui.on_go_to(|text| with_app(|a| a.go_to(&text)));
     ui.on_row_range(|i| with_app(|a| a.row_range(i as usize)));
     ui.on_local_row_range(|i| with_app(|a| a.local_row_range(i as usize)));
@@ -2513,6 +2744,22 @@ mod tests {
         assert_eq!(ssh("/var/log"), (Some(String::new()), "var/log/".into()));
         assert_eq!(ssh("sftp://me@box"), (Some(String::new()), String::new()));
         assert_eq!(ssh("/"), (Some(String::new()), String::new()));
+    }
+
+    /// Saving from the editor replaces the file itself and keeps CRLF.
+    #[tokio::test]
+    async fn editor_overwrites_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, b"one\r\ntwo\r\n").unwrap();
+        let source = PreviewSource::Local(path.clone());
+        let doc = editor::decode("note.txt", read_source(&source).await.unwrap()).unwrap();
+        let edited = doc.text.replace("two", "dua");
+        write_source(&source, &editor::encode(&edited, doc.crlf))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"one\r\ndua\r\n");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

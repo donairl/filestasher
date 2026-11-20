@@ -20,6 +20,8 @@ through jump hosts, and for FTP servers, written in Rust with a
 - Upload files, with multipart upload for files larger than 32 MiB.
 - Download files and whole folders.
 - Image preview: double-click a PNG, JPEG, GIF, BMP, WebP or ICO file.
+- Text editor: double-click a text file, on the server or in the local pane,
+  to edit it in a pop-up with line numbers. Ctrl+S saves, Esc closes.
 - Right-click menu on the file list: open, preview, download, copy the path or
   the `s3://` URI to the clipboard.
 - Local folder pane on the right, with sortable columns, image preview and a
@@ -32,9 +34,8 @@ through jump hosts, and for FTP servers, written in Rust with a
 - Delete files and folders, always after a confirmation.
 - Transfer progress in the status bar.
 
-Not supported yet: copy/move, rename in the local pane, presigned URLs, preview
-of non-image files, drag and drop from other applications, creating or
-deleting buckets.
+Not supported yet: copy/move, rename in the local pane, presigned URLs, drag
+and drop from other applications, creating or deleting buckets.
 
 ## Requirements
 
@@ -181,6 +182,11 @@ be entered again.
   taken. S3 has no rename: every object is copied to its new key and the old
   one deleted, so renaming a large folder takes one request per object, and
   objects over 5 GB cannot be renamed.
+- The editor opens UTF-8 text files up to 2 MB; binary and larger files are
+  refused with a message. **Save** asks first, then overwrites the file itself
+  (on a server: uploads it again), and warns when the file changed since it
+  was opened. Line endings (LF or CRLF) are kept. A local file that cannot be
+  written opens read-only.
 - Errors are shown in the status bar of the tab.
 
 ## Project layout
@@ -193,6 +199,7 @@ be entered again.
 | `src/ftp.rs`    | FTP operations on top of `suppaftp`.                       |
 | `src/remote.rs` | Picks S3, SFTP or FTP for a tab.                           |
 | `src/config.rs` | Server profiles, load and save.                            |
+| `src/editor.rs` | Text file detection and line endings for the editor.       |
 | `src/util.rs`   | Size and time formatting, prefix navigation, safe paths.   |
 | `ui/app.slint`  | Window, sidebar, tabs, file list and dialogs.              |
 

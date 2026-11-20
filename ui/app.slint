@@ -1,4 +1,4 @@
-import { Button, LineEdit, CheckBox, ComboBox, ListView, ProgressIndicator, Spinner, Palette } from "std-widgets.slint";
+import { Button, LineEdit, CheckBox, ComboBox, ListView, ScrollView, ProgressIndicator, Spinner, Palette } from "std-widgets.slint";
 
 export struct ServerItem {
     name: string,
@@ -366,6 +366,25 @@ export component MainWindow inherits Window {
     callback confirm-rejected();
     callback cancel-transfers();
 
+    // Text editor
+    in-out property <bool> editor-open;
+    in property <string> editor-name;
+    in property <string> editor-path;
+    in property <string> editor-font;
+    in-out property <string> editor-text;
+    // The line numbers, one per line.
+    in property <string> editor-lines;
+    in property <bool> editor-dirty;
+    in property <bool> editor-read-only;
+    in property <string> editor-message;
+    // The question about unsaved changes.
+    in-out property <bool> editor-close-open;
+    callback editor-edited(string);
+    // Asks before overwriting; true = close the editor afterwards.
+    callback editor-save(bool);
+    callback editor-close();
+    callback editor-discard();
+
     // New folder dialog
     in-out property <bool> newfolder-open;
     in-out property <string> newfolder-name;
@@ -388,7 +407,7 @@ export component MainWindow inherits Window {
                 root.preview-open = false;
                 return accept;
             }
-            if (root.server-dialog-open || root.newfolder-open || root.conflict-open || root.confirm-open || root.preview-open) {
+            if (root.editor-open || root.server-dialog-open || root.newfolder-open || root.conflict-open || root.confirm-open || root.preview-open) {
                 return reject;
             }
             if (ev.text == Key.F5) {
@@ -1433,6 +1452,200 @@ export component MainWindow inherits Window {
                 primary: true;
                 clicked => {
                     root.save-server();
+                }
+            }
+        }
+    }
+
+    if root.editor-open: Rectangle {
+        background: #000000a0;
+
+        // Swallows clicks so the window behind is inert.
+        TouchArea { }
+
+        Rectangle {
+            x: 24px;
+            y: 24px;
+            width: parent.width - 48px;
+            height: parent.height - 48px;
+            background: Palette.background;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Palette.border;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        Text {
+                            // The dot marks unsaved changes.
+                            text: (root.editor-dirty ? "● " : "") + root.editor-name;
+                            font-size: 16px;
+                            font-weight: 600;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: root.editor-path;
+                            font-size: 11px;
+                            opacity: 0.7;
+                            overflow: elide;
+                        }
+                    }
+
+                    Button {
+                        text: "Save";
+                        icon: @image-url("icons/check.svg");
+                        colorize-icon: true;
+                        primary: true;
+                        enabled: root.editor-dirty && !root.editor-read-only;
+                        clicked => {
+                            root.editor-save(false);
+                        }
+                    }
+
+                    Button {
+                        text: "Close";
+                        icon: @image-url("icons/close.svg");
+                        colorize-icon: true;
+                        clicked => {
+                            root.editor-close();
+                        }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-width: 1px;
+                    border-color: Palette.border;
+                    background: Palette.control-background;
+                    HorizontalLayout {
+                        padding: 1px;
+                        // Line numbers: as wide as the largest one, and they
+                        // follow the text up and down.
+                        Rectangle {
+                            width: numbers.preferred-width + 16px;
+                            clip: true;
+                            background: Palette.alternate-background;
+                            numbers := Text {
+                                x: 8px;
+                                y: editor-scroll.content-y + 4px;
+                                width: self.preferred-width;
+                                text: root.editor-lines;
+                                font-family: root.editor-font;
+                                font-size: 13px;
+                                horizontal-alignment: right;
+                                opacity: 0.6;
+                            }
+                        }
+
+                        editor-scroll := ScrollView {
+                            horizontal-stretch: 1;
+                            content-width: max(self.visible-width, editor-input.preferred-width + 16px);
+                            content-height: max(self.visible-height, editor-input.preferred-height + 8px);
+                            editor-input := TextInput {
+                                x: 8px;
+                                y: 4px;
+                                width: parent.content-width - 16px;
+                                height: parent.content-height - 8px;
+                                text <=> root.editor-text;
+                                single-line: false;
+                                wrap: no-wrap;
+                                font-family: root.editor-font;
+                                font-size: 13px;
+                                color: Palette.foreground;
+                                page-height: editor-scroll.visible-height;
+                                // A question on top takes the keyboard away.
+                                read-only: root.editor-read-only || root.confirm-open || root.editor-close-open;
+                                init => {
+                                    self.focus();
+                                }
+                                edited => {
+                                    root.editor-edited(self.text);
+                                }
+                                key-pressed(ev) => {
+                                    if (root.confirm-open || root.editor-close-open) {
+                                        return accept;
+                                    }
+                                    if (ev.modifiers.control && ev.text == "s") {
+                                        root.editor-save(false);
+                                        return accept;
+                                    }
+                                    if (ev.text == Key.Escape) {
+                                        root.editor-close();
+                                        return accept;
+                                    }
+                                    return reject;
+                                }
+                                // Keeps the cursor in view, as TextEdit does.
+                                cursor-position-changed(pos) => {
+                                    if (pos.x + parent.content-x < 0px) {
+                                        parent.content-x = min(0px, -pos.x);
+                                    } else if (pos.x + parent.content-x > parent.visible-width - 24px) {
+                                        parent.content-x = parent.visible-width - 24px - pos.x;
+                                    }
+                                    if (pos.y + parent.content-y < 0px) {
+                                        parent.content-y = min(0px, -pos.y);
+                                    } else if (pos.y + parent.content-y > parent.visible-height - 28px) {
+                                        parent.content-y = parent.visible-height - 28px - pos.y;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.editor-message != "" ? root.editor-message : "Ctrl+S save · Esc close";
+                    font-size: 11px;
+                    opacity: 0.8;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+
+    if root.editor-close-open: Modal {
+        title: "Unsaved changes";
+        box-width: 420px;
+        Text {
+            text: "Save the changes to " + root.editor-name + "?";
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+            Button {
+                text: "Cancel";
+                icon: @image-url("icons/close.svg");
+                colorize-icon: true;
+                clicked => {
+                    root.editor-close-open = false;
+                }
+            }
+
+            Button {
+                text: "Discard";
+                icon: @image-url("icons/trash.svg");
+                colorize-icon: true;
+                clicked => {
+                    root.editor-close-open = false;
+                    root.editor-discard();
+                }
+            }
+
+            Button {
+                text: "Save";
+                icon: @image-url("icons/check.svg");
+                colorize-icon: true;
+                primary: true;
+                enabled: !root.editor-read-only;
+                clicked => {
+                    root.editor-close-open = false;
+                    root.editor-save(true);
                 }
             }
         }
