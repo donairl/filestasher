@@ -1751,6 +1751,7 @@ impl App {
                 name: e.name.as_str().into(),
                 is_dir: e.is_dir,
                 is_image: !e.is_dir && is_image(&e.name),
+                is_hidden: e.name.starts_with('.'),
                 size: if e.is_dir {
                     SharedString::new()
                 } else {
@@ -2141,6 +2142,7 @@ fn file_row(e: &Entry, in_bucket: bool, selected: bool) -> FileEntry {
         name: e.name.as_str().into(),
         is_dir: e.is_dir,
         is_image: !e.is_dir && in_bucket && is_image(&e.name),
+        is_hidden: e.name.starts_with('.'),
         size: if e.is_dir {
             SharedString::new()
         } else {
