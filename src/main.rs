@@ -2186,16 +2186,13 @@ fn count_status(count: usize, has_more: bool) -> String {
 
 // ---- Background work -------------------------------------------------------
 
-/// Lists a local folder, unsorted. Hidden entries (names starting with a dot)
-/// are left out.
+/// Lists a local folder, unsorted. Follows symlinks; entries that cannot be read
+/// are skipped.
 fn read_local_dir(dir: &std::path::Path) -> Result<Vec<LocalEntry>> {
     let mut out = Vec::new();
     for item in std::fs::read_dir(dir)? {
         let item = item?;
         let name = item.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
         // Follows symlinks; entries that cannot be read are skipped.
         let Ok(meta) = std::fs::metadata(item.path()) else {
             continue;
@@ -2608,11 +2605,12 @@ mod tests {
         }
         .apply(&mut listing, &mut selected);
         let names: Vec<&str> = listing.iter().map(|e| e.name.as_str()).collect();
-        // Folders first, hidden files left out.
-        assert_eq!(names, ["docs", "A.txt", "b.txt"]);
+        // Folders first, dotfiles and regular files sorted by name ascending.
+        assert_eq!(names, ["docs", ".hidden", "A.txt", "b.txt"]);
         assert!(listing[0].is_dir);
-        assert_eq!(listing[2].size, 5);
-        assert!(listing[2].modified.is_some());
+        assert_eq!(listing[1].size, 1);
+        assert_eq!(listing[3].size, 5);
+        assert!(listing[3].modified.is_some());
 
         let mut uploads =
             collect_uploads(&[root.join("docs"), root.join("b.txt")], "base/").unwrap();
