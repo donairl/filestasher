@@ -908,6 +908,7 @@ export component MainWindow inherits Window {
                     }
 
                     HorizontalLayout {
+                        opacity: entry.is-hidden && !entry.selected ? 0.6 : 1.0;
                         padding-left: 8px;
                         padding-right: 8px;
                         spacing: 8px;
@@ -1199,6 +1200,7 @@ export component MainWindow inherits Window {
                         }
 
                         HorizontalLayout {
+                            opacity: entry.is-hidden && !entry.selected ? 0.6 : 1.0;
                             padding-left: 6px;
                             padding-right: 6px;
                             spacing: 8px;
